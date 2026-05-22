@@ -566,6 +566,30 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertTrue(search_payload['success'])
         self.assertEqual(search_payload['accounts'][0]['sort_order'], 7)
 
+    def test_account_search_is_scoped_to_requested_group(self):
+        source_group_id = self._create_group('source-search-group')
+        target_group_id = self._create_group('target-search-group')
+        moved_account_id = self._insert_account('moved-search@example.com', group_id=target_group_id)
+        self._insert_account('source-only@example.com', group_id=source_group_id)
+
+        source_response = self.client.get(
+            f'/api/accounts/search?group_id={source_group_id}&q=moved-search'
+        )
+        self.assertEqual(source_response.status_code, 200)
+        source_payload = source_response.get_json()
+        self.assertTrue(source_payload['success'])
+        self.assertEqual(source_payload['total'], 0)
+        self.assertEqual(source_payload['accounts'], [])
+
+        target_response = self.client.get(
+            f'/api/accounts/search?group_id={target_group_id}&q=moved-search'
+        )
+        self.assertEqual(target_response.status_code, 200)
+        target_payload = target_response.get_json()
+        self.assertTrue(target_payload['success'])
+        self.assertEqual(target_payload['total'], 1)
+        self.assertEqual(target_payload['accounts'][0]['id'], moved_account_id)
+
     def test_add_account_without_sort_order_uses_created_at_fallback(self):
         response = self.client.post(
             '/api/accounts',
@@ -1097,6 +1121,17 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('settings.show_group_id = showGroupId;', settings_js)
         self.assertIn("setShowGroupId(String(data?.settings?.show_group_id) !== 'false');", core_js)
         self.assertIn('if (!shouldShowGroupId()) {', core_js)
+
+    def test_account_search_request_includes_current_group_scope(self):
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        search_request_block = groups_js.split("async function searchAccounts(query, forceRefresh = false, append = false)", 1)[1]
+
+        self.assertIn("if (currentGroupId && !isTempEmailGroup) {", search_request_block)
+        self.assertIn("params.set('group_id', String(currentGroupId));", search_request_block)
+        self.assertLess(
+            search_request_block.index("params.set('group_id', String(currentGroupId));"),
+            search_request_block.index("fetch(`/api/accounts/search?${params.toString()}`)")
+        )
 
     def test_settings_ui_reorganizes_general_and_gptmail_sections(self):
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')

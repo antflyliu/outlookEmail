@@ -1215,6 +1215,9 @@
                 q: query,
                 offset: String(offset)
             }));
+            if (currentGroupId && !isTempEmailGroup) {
+                params.set('group_id', String(currentGroupId));
+            }
             const requestId = ++accountListRequestSeq;
 
             try {
