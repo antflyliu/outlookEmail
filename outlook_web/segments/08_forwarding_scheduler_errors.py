@@ -4,6 +4,7 @@ import sys
 import time
 
 from typing import TYPE_CHECKING, Any, Dict, Optional
+from werkzeug.exceptions import HTTPException
 
 if TYPE_CHECKING:
     # These segmented files are executed into the shared `web_outlook_app`
@@ -1479,9 +1480,19 @@ def bad_request(error):
     return jsonify({'success': False, 'error': '请求格式错误'}), 400
 
 
+@app.errorhandler(HTTPException)
+def handle_http_exception(error):
+    """Preserve HTTP routing/status errors such as 404 instead of converting them to 500."""
+    status_code = error.code or 500
+    return jsonify({'success': False, 'error': error.description}), status_code
+
+
 @app.errorhandler(Exception)
 def handle_exception(error):
     """处理未捕获的异常"""
+    if isinstance(error, HTTPException):
+        return handle_http_exception(error)
+
     safe_console_print(f"Unhandled exception: {error}")
     import traceback
     traceback.print_exc()

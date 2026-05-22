@@ -644,7 +644,7 @@ def api_external_get_accounts():
         safe_accounts.append(
             serialize_account_summary(
                 acc,
-                {},
+                None,
                 include_client_meta=False,
                 include_imap_meta=False
             )
@@ -655,6 +655,117 @@ def api_external_get_accounts():
         'total': len(safe_accounts),
         'accounts': safe_accounts
     })
+
+
+@app.route('/api/external/accounts/batch-update-group', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_batch_update_account_group():
+    """对外 API：通过 API Key 批量更新账号分组"""
+    data = request.get_json(silent=True) or {}
+    group_id = data.get('group_id') or data.get('to_group_id')
+    from_group_id = data.get('from_group_id') or data.get('source_group_id')
+    email = str(data.get('email') or '').strip().lower()
+
+    raw_account_ids = data.get('account_ids', [])
+    if not isinstance(raw_account_ids, list):
+        raw_account_ids = []
+    if data.get('account_id'):
+        raw_account_ids.append(data.get('account_id'))
+
+    account_ids = []
+    for value in raw_account_ids:
+        try:
+            account_id = int(value)
+        except (TypeError, ValueError):
+            continue
+        if account_id > 0 and account_id not in account_ids:
+            account_ids.append(account_id)
+
+    try:
+        target_group_id = int(group_id)
+    except (TypeError, ValueError):
+        target_group_id = 0
+    try:
+        source_group_id = int(from_group_id) if from_group_id is not None else None
+    except (TypeError, ValueError):
+        source_group_id = None
+
+    if not target_group_id:
+        return jsonify({'success': False, 'error': '请选择目标分组'}), 400
+
+    group = get_group_by_id(target_group_id)
+    if not group:
+        return jsonify({'success': False, 'error': '目标分组不存在'}), 404
+    if group.get('is_system'):
+        return jsonify({'success': False, 'error': '不能移动到系统分组'}), 400
+
+    if not account_ids and email:
+        accounts = load_accounts(source_group_id)
+        matched = next(
+            (
+                account for account in accounts
+                if str(account.get('email') or '').strip().lower() == email
+                or email in [
+                    str(alias).strip().lower()
+                    for alias in account.get('aliases', [])
+                ]
+            ),
+            None
+        )
+        if matched:
+            account_ids = [int(matched['id'])]
+
+    if not account_ids:
+        return jsonify({'success': False, 'error': '请选择要修改的账号或提供有效 email'}), 400
+
+    db = get_db()
+    placeholders = ','.join('?' * len(account_ids))
+    rows = db.execute(f'''
+        SELECT id, email, group_id
+        FROM accounts
+        WHERE id IN ({placeholders})
+    ''', account_ids).fetchall()
+    if not rows:
+        return jsonify({'success': False, 'error': '账号不存在'}), 404
+
+    already_target_ids = [
+        int(row['id']) for row in rows
+        if int(row['group_id'] or 0) == target_group_id
+    ]
+    movable_ids = [
+        int(row['id']) for row in rows
+        if int(row['group_id'] or 0) != target_group_id
+        and (source_group_id is None or int(row['group_id'] or 0) == source_group_id)
+    ]
+
+    if not movable_ids:
+        if len(already_target_ids) == len(rows):
+            return jsonify({
+                'success': True,
+                'message': f'账号已在「{group["name"]}」分组',
+                'account_ids': already_target_ids,
+                'group_id': target_group_id,
+                'moved_count': 0,
+            })
+        return jsonify({'success': False, 'error': '账号不在指定源分组'}), 409
+
+    try:
+        update_placeholders = ','.join('?' * len(movable_ids))
+        db.execute(f'''
+            UPDATE accounts SET group_id = ?, updated_at = CURRENT_TIMESTAMP
+            WHERE id IN ({update_placeholders})
+        ''', [target_group_id] + movable_ids)
+        db.commit()
+        return jsonify({
+            'success': True,
+            'message': f'已将 {len(movable_ids)} 个账号移动到「{group["name"]}」分组',
+            'account_ids': movable_ids + already_target_ids,
+            'group_id': target_group_id,
+            'moved_count': len(movable_ids),
+        })
+    except Exception as e:
+        return jsonify({'success': False, 'error': str(e)}), 500
 
 
 # ==================== 项目 API ====================

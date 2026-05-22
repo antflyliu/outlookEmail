@@ -2042,9 +2042,14 @@ def api_key_required(f):
     @wraps(f)
     def decorated_function(*args, **kwargs):
         # 从 Header 或查询参数获取 API Key
-        api_key = request.headers.get('X-API-Key') or request.args.get('api_key') or request.args.get('apikey')
+        api_key = (
+            request.headers.get('X-API-Key')
+            or request.args.get('api_key')
+            or request.args.get('apikey')
+            or request.args.get('api_token')
+        )
         if not api_key:
-            return jsonify({'success': False, 'error': '缺少 API Key，请通过 Header X-API-Key 或查询参数 api_key 提供'}), 401
+            return jsonify({'success': False, 'error': '缺少 API Key，请通过 Header X-API-Key 或查询参数 api_key/api_token 提供'}), 401
 
         # 验证 API Key
         stored_key = get_external_api_key()

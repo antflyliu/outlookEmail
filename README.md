@@ -2,6 +2,7 @@
 
 一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
 ## 📦 快速开始
+
 ### 体验站点（可能非最新版本）
 https://aso.de5.net
 admin123
@@ -215,6 +216,7 @@ Web 应用采用四栏式布局设计：
 ![邮箱列表](img/邮箱列表.png)
 
 ### 全局搜索功能
+
 ![全局搜索](img/全局搜索.png)
 
 ### 导入邮箱账号

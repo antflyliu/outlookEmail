@@ -33,6 +33,7 @@
 | 方法 | 路径 | 鉴权 | 返回类型 | 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
+| POST | `/api/external/accounts/batch-update-group` | API Key | JSON | 批量改普通邮箱账号分组 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 
 ### 分组、账号、标签、项目
@@ -134,7 +135,7 @@
 对外 API 使用 API Key 认证，支持两种方式：
 
 - Header: `X-API-Key: your-api-key`
-- Query: `?api_key=your-api-key`
+- Query: `?api_key=your-api-key` 或 `?api_token=your-api-key`
 
 可在 Web 界面 `设置 -> 对外 API Key` 中配置。
 
@@ -337,6 +338,42 @@ curl -H "X-API-Key: your-api-key" \
 - 该接口只返回普通邮箱账号，不包含临时邮箱列表
 - 已隐藏密码、Refresh Token、IMAP 密码等敏感字段
 - 如需拉取某个邮箱的邮件列表，再调用 `/api/external/emails`
+
+### POST `/api/external/accounts/batch-update-group`
+
+通过 API Key 把普通邮箱账号移动到目标分组。适合外部自动化在账号完成业务流程后，把账号从待处理分组移入成功分组。
+
+#### 请求体
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `group_id` | int | 是 | 目标分组 ID |
+| `account_ids` | int[] | 否 | 要移动的账号 ID 列表；与 `email` 至少提供一个 |
+| `account_id` | int | 否 | 单个账号 ID，兼容不想传数组的调用方 |
+| `email` | string | 否 | 按邮箱地址查找账号；与 `account_ids` 至少提供一个 |
+| `from_group_id` | int | 否 | 源分组 ID；提供后只移动仍在该源分组的账号 |
+
+#### 请求示例
+
+```bash
+curl -X POST \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: your-api-key" \
+  -d '{"email":"user@outlook.com","from_group_id":20,"group_id":33}' \
+  "http://localhost:5000/api/external/accounts/batch-update-group"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "message": "已将 1 个账号移动到「订阅成功」分组",
+  "account_ids": [1],
+  "group_id": 33,
+  "moved_count": 1
+}
+```
 
 ### GET `/api/external/emails`
 

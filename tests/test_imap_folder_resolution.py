@@ -630,6 +630,50 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertFalse(payload['success'])
         self.assertIn('API Key', payload['error'])
 
+    def test_external_accounts_accepts_api_token_query_alias(self):
+        response = self.client.get('/api/external/accounts?group_id=1&api_token=test-external-key')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['total'], 1)
+
+    def test_external_batch_update_group_requires_api_key(self):
+        response = self.client.post('/api/external/accounts/batch-update-group', json={
+            'email': 'user@outlook.com',
+            'group_id': 1,
+        })
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('API Key', payload['error'])
+
+    def test_external_batch_update_group_moves_account_by_email(self):
+        with self.app.app_context():
+            target_group_id = web_outlook_app.add_group('订阅成功', '已订阅账号', '#16a34a')
+            self.assertIsNotNone(target_group_id)
+
+        response = self.client.post(
+            '/api/external/accounts/batch-update-group',
+            headers={'X-API-Key': 'test-external-key'},
+            json={
+                'email': 'user@outlook.com',
+                'from_group_id': 1,
+                'group_id': target_group_id,
+            }
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['group_id'], target_group_id)
+        self.assertEqual(payload['moved_count'], 1)
+
+        with self.app.app_context():
+            account = web_outlook_app.get_account_by_email('user@outlook.com')
+        self.assertEqual(account['group_id'], target_group_id)
+
     def test_internal_emails_requires_login(self):
         response = self.client.get('/api/emails/user@outlook.com?folder=inbox')
 
