@@ -50,6 +50,56 @@ def resource_path(*parts: str) -> Path:
     return bundle_root().joinpath(*parts)
 
 
+def _strip_env_comment(value: str) -> str:
+    quote: str | None = None
+    escaped = False
+    for index, char in enumerate(value):
+        if escaped:
+            escaped = False
+            continue
+        if char == "\\":
+            escaped = True
+            continue
+        if char in ("'", '"'):
+            if quote is None:
+                quote = char
+            elif quote == char:
+                quote = None
+            continue
+        if char == "#" and quote is None and (index == 0 or value[index - 1].isspace()):
+            return value[:index].rstrip()
+    return value.strip()
+
+
+def load_local_env(env_path: Path | None = None) -> None:
+    """Load simple KEY=value pairs from .env for direct Python execution."""
+    if is_frozen():
+        return
+
+    path = env_path or (bundle_root() / ".env")
+    if not path.exists():
+        return
+
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+
+        key, value = line.split("=", 1)
+        key = key.strip()
+        if key.startswith("export "):
+            key = key[7:].strip()
+        if not key or any(char.isspace() for char in key):
+            continue
+        if key in os.environ:
+            continue
+
+        value = _strip_env_comment(value).strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in ("'", '"'):
+            value = value[1:-1]
+        os.environ[key] = value
+
+
 def default_database_path() -> Path:
     if is_frozen():
         return runtime_root() / "data" / DATABASE_FILE

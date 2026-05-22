@@ -7,7 +7,7 @@ import threading
 import webbrowser
 from pathlib import Path
 
-from outlook_web.runtime import is_frozen, notify_startup_error, record_startup_error
+from outlook_web.runtime import is_frozen, load_local_env, notify_startup_error, record_startup_error
 from werkzeug.serving import make_server
 
 
@@ -24,6 +24,8 @@ SEGMENT_FILES = (
 )
 
 SEGMENTS_DIR = Path(__file__).resolve().parent / "outlook_web" / "segments"
+
+load_local_env()
 
 def _load_segmented_app():
     if globals().get("_SEGMENTED_APP_LOADED"):

@@ -10,6 +10,7 @@ build/
 venv/
 env/
 ENV/
+.venv*/
 
 # 数据库文件
 *.db
