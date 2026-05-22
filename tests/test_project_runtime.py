@@ -1133,6 +1133,43 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
             search_request_block.index("fetch(`/api/accounts/search?${params.toString()}`)")
         )
 
+    def test_main_four_panel_layout_uses_draggable_splitters(self):
+        layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        layout_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '03-layout.css').read_text(encoding='utf-8')
+        account_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '04-account-panel.css').read_text(encoding='utf-8')
+        email_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '05-email-content.css').read_text(encoding='utf-8')
+        responsive_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '08-responsive.css').read_text(encoding='utf-8')
+        core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
+
+        self.assertEqual(layout_html.count('data-layout-resizer'), 3)
+        self.assertIn('id="groupAccountResizer"', layout_html)
+        self.assertIn('data-resize-target="groupPanel"', layout_html)
+        self.assertIn('id="accountEmailResizer"', layout_html)
+        self.assertIn('data-resize-target="accountPanel"', layout_html)
+        self.assertIn('id="emailDetailResizer"', layout_html)
+        self.assertIn('data-resize-target="emailListPanel"', layout_html)
+        self.assertIn('role="separator"', layout_html)
+        self.assertIn('aria-orientation="vertical"', layout_html)
+
+        self.assertIn('--group-panel-width: 200px;', layout_css)
+        self.assertIn('width: var(--group-panel-width, 200px);', layout_css)
+        self.assertIn('width: var(--account-panel-width, 340px);', account_css)
+        self.assertIn('width: var(--email-list-panel-width, 400px);', email_css)
+        self.assertIn('.email-list-panel.hidden + .layout-resizer {', email_css)
+        self.assertIn('.email-list-panel.hidden + .layout-resizer + .email-detail-panel {', responsive_css)
+        self.assertIn('.layout-resizer {', responsive_css)
+        mobile_resizer_rule = responsive_css.split('.layout-resizer {', 1)[1].split('}', 1)[0]
+        self.assertIn('display: none;', mobile_resizer_rule)
+
+        self.assertIn('function initLayoutResizers()', core_js)
+        self.assertIn('function startLayoutResize(event)', core_js)
+        self.assertIn('function handleGlobalLayoutResizePointerMove(event)', core_js)
+        self.assertIn('function handleLayoutResizerKeydown(event)', core_js)
+        self.assertIn('function ensureLayoutResizerMarkup()', core_js)
+        self.assertIn("panel.insertAdjacentElement('afterend', createLayoutResizerElement(id, panelId, label));", core_js)
+        self.assertIn("window.localStorage.setItem(LAYOUT_RESIZER_STORAGE_KEY", core_js)
+        self.assertIn('initLayoutResizers();', core_js)
+
     def test_settings_ui_reorganizes_general_and_gptmail_sections(self):
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
 

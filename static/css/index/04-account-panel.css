@@ -1,6 +1,6 @@
         /* 邮箱账号面板 */
         .account-panel {
-            width: 340px;
+            width: var(--account-panel-width, 340px);
             background-color: #ffffff;
             border-right: 1px solid #e5e5e5;
             display: flex;

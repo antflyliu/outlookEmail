@@ -72,6 +72,23 @@
         let showAccountCreatedAt = true;
         let showAccountSortOrder = false;
         let showGroupId = true;
+        const LAYOUT_RESIZER_STORAGE_KEY = 'outlookEmail.layoutPanelWidths.v1';
+        const LAYOUT_DETAIL_MIN_WIDTH = 240;
+        const LAYOUT_PANEL_RESIZE_CONFIG = {
+            groupPanel: {
+                cssVar: '--group-panel-width',
+                min: 140,
+            },
+            accountPanel: {
+                cssVar: '--account-panel-width',
+                min: 220,
+            },
+            emailListPanel: {
+                cssVar: '--email-list-panel-width',
+                min: 260,
+            },
+        };
+        let layoutResizeState = null;
 
         function isUntaggedTagFilterValue(value) {
             return String(value || '').trim() === UNTAGGED_TAG_FILTER_KEY;
@@ -929,6 +946,9 @@
                 if (toggleText) {
                     toggleText.textContent = '隐藏列表';
                 }
+                restoreLayoutPanelWidths();
+            } else {
+                stopLayoutResize();
             }
 
             updateMobileContext();
@@ -1126,6 +1146,7 @@
             }
             initColorPicker();
             initColorPicker();
+            initLayoutResizers();
             initEmailListScroll();
             initAccountListScroll();
             initAccountPageSizeSelect();
@@ -1170,6 +1191,286 @@
             if (shouldOpen) {
                 accountItem.classList.add('menu-open');
             }
+        }
+
+        function getLayoutResizeRoot() {
+            return document.querySelector('.main-container');
+        }
+
+        function getLayoutPanelWidth(panelId) {
+            const panel = document.getElementById(panelId);
+            return panel ? panel.getBoundingClientRect().width : 0;
+        }
+
+        function readStoredLayoutPanelWidths() {
+            try {
+                const rawValue = window.localStorage.getItem(LAYOUT_RESIZER_STORAGE_KEY);
+                const parsedValue = rawValue ? JSON.parse(rawValue) : {};
+                return parsedValue && typeof parsedValue === 'object' ? parsedValue : {};
+            } catch (error) {
+                return {};
+            }
+        }
+
+        function saveLayoutPanelWidth(panelId, width) {
+            const numericWidth = Math.round(Number(width));
+            if (!LAYOUT_PANEL_RESIZE_CONFIG[panelId] || !Number.isFinite(numericWidth)) {
+                return;
+            }
+
+            try {
+                const storedWidths = readStoredLayoutPanelWidths();
+                storedWidths[panelId] = numericWidth;
+                window.localStorage.setItem(LAYOUT_RESIZER_STORAGE_KEY, JSON.stringify(storedWidths));
+            } catch (error) {
+                // localStorage can be unavailable in restricted browser contexts.
+            }
+        }
+
+        function getMaxResizablePanelWidth(panelId) {
+            const config = LAYOUT_PANEL_RESIZE_CONFIG[panelId];
+            const minWidth = config?.min || 0;
+
+            if (panelId === 'emailListPanel') {
+                const contentArea = document.querySelector('.content-area');
+                const contentWidth = contentArea ? contentArea.getBoundingClientRect().width : 0;
+                return Math.max(minWidth, contentWidth - LAYOUT_DETAIL_MIN_WIDTH);
+            }
+
+            const container = getLayoutResizeRoot();
+            if (!container) {
+                return minWidth;
+            }
+
+            const groupWidth = getLayoutPanelWidth('groupPanel');
+            const accountWidth = getLayoutPanelWidth('accountPanel');
+            const emailListPanel = document.getElementById('emailListPanel');
+            const emailListWidth = emailListPanel?.classList.contains('hidden')
+                ? 0
+                : getLayoutPanelWidth('emailListPanel');
+            const otherSidePanelWidth = panelId === 'groupPanel' ? accountWidth : groupWidth;
+            const reservedContentWidth = emailListWidth + LAYOUT_DETAIL_MIN_WIDTH;
+            const maxWidth = container.getBoundingClientRect().width - otherSidePanelWidth - reservedContentWidth;
+            return Math.max(minWidth, maxWidth);
+        }
+
+        function clampLayoutPanelWidth(panelId, width) {
+            const config = LAYOUT_PANEL_RESIZE_CONFIG[panelId];
+            if (!config) {
+                return 0;
+            }
+
+            const numericWidth = Number(width);
+            const minWidth = config.min;
+            const maxWidth = getMaxResizablePanelWidth(panelId);
+            if (!Number.isFinite(numericWidth)) {
+                return minWidth;
+            }
+
+            return Math.round(Math.min(Math.max(numericWidth, minWidth), maxWidth));
+        }
+
+        function updateLayoutResizerAria(panelId, width) {
+            const resizer = document.querySelector(`[data-layout-resizer][data-resize-target="${panelId}"]`);
+            const config = LAYOUT_PANEL_RESIZE_CONFIG[panelId];
+            if (!resizer || !config) {
+                return;
+            }
+
+            resizer.setAttribute('aria-valuemin', String(config.min));
+            resizer.setAttribute('aria-valuemax', String(Math.round(getMaxResizablePanelWidth(panelId))));
+            resizer.setAttribute('aria-valuenow', String(Math.round(width || getLayoutPanelWidth(panelId))));
+        }
+
+        function applyLayoutPanelWidth(panelId, width, { persist = false } = {}) {
+            const config = LAYOUT_PANEL_RESIZE_CONFIG[panelId];
+            const root = getLayoutResizeRoot();
+            if (!config || !root) {
+                return;
+            }
+
+            const clampedWidth = clampLayoutPanelWidth(panelId, width);
+            root.style.setProperty(config.cssVar, `${clampedWidth}px`);
+            updateLayoutResizerAria(panelId, clampedWidth);
+            if (persist) {
+                saveLayoutPanelWidth(panelId, clampedWidth);
+            }
+            scheduleEmailListLoadCheck(0);
+        }
+
+        function restoreLayoutPanelWidths() {
+            if (isMobileLayout()) {
+                return;
+            }
+
+            const storedWidths = readStoredLayoutPanelWidths();
+            Object.keys(LAYOUT_PANEL_RESIZE_CONFIG).forEach(panelId => {
+                const storedWidth = Number(storedWidths[panelId]);
+                if (Number.isFinite(storedWidth)) {
+                    applyLayoutPanelWidth(panelId, storedWidth);
+                } else {
+                    updateLayoutResizerAria(panelId, getLayoutPanelWidth(panelId));
+                }
+            });
+        }
+
+        function stopLayoutResize(event = null) {
+            if (!layoutResizeState) {
+                return;
+            }
+
+            const { panelId, resizer, pointerId } = layoutResizeState;
+            if (event && event.pointerId !== pointerId) {
+                return;
+            }
+
+            const finalWidth = getLayoutPanelWidth(panelId);
+            saveLayoutPanelWidth(panelId, finalWidth);
+            resizer?.classList.remove('is-dragging');
+            try {
+                if (pointerId !== undefined && resizer?.hasPointerCapture?.(pointerId)) {
+                    resizer.releasePointerCapture(pointerId);
+                }
+            } catch (error) {
+                // Some browsers throw if capture has already been released.
+            }
+            document.body.classList.remove('layout-resizing');
+            window.removeEventListener('pointermove', handleGlobalLayoutResizePointerMove);
+            window.removeEventListener('pointerup', stopLayoutResize);
+            window.removeEventListener('pointercancel', stopLayoutResize);
+            layoutResizeState = null;
+        }
+
+        function handleGlobalLayoutResizePointerMove(event) {
+            if (!layoutResizeState || event.pointerId !== layoutResizeState.pointerId) {
+                return;
+            }
+
+            event.preventDefault();
+            const nextWidth = layoutResizeState.startWidth + event.clientX - layoutResizeState.startX;
+            applyLayoutPanelWidth(layoutResizeState.panelId, nextWidth);
+        }
+
+        function startLayoutResize(event) {
+            if (event.button !== 0 || isMobileLayout()) {
+                return;
+            }
+
+            const resizer = event.currentTarget;
+            const panelId = resizer?.dataset?.resizeTarget || '';
+            const panel = document.getElementById(panelId);
+            if (!panel || !LAYOUT_PANEL_RESIZE_CONFIG[panelId]) {
+                return;
+            }
+
+            event.preventDefault();
+            layoutResizeState = {
+                panelId,
+                resizer,
+                pointerId: event.pointerId,
+                startX: event.clientX,
+                startWidth: panel.getBoundingClientRect().width,
+            };
+            resizer.classList.add('is-dragging');
+            document.body.classList.add('layout-resizing');
+            try {
+                resizer.setPointerCapture(event.pointerId);
+            } catch (error) {
+                // Pointer capture is an enhancement; global listeners still handle drag.
+            }
+            window.addEventListener('pointermove', handleGlobalLayoutResizePointerMove, { passive: false });
+            window.addEventListener('pointerup', stopLayoutResize);
+            window.addEventListener('pointercancel', stopLayoutResize);
+        }
+
+        function handleLayoutResizerKeydown(event) {
+            if (isMobileLayout()) {
+                return;
+            }
+
+            const panelId = event.currentTarget?.dataset?.resizeTarget || '';
+            const config = LAYOUT_PANEL_RESIZE_CONFIG[panelId];
+            if (!config) {
+                return;
+            }
+
+            const currentWidth = getLayoutPanelWidth(panelId);
+            const step = event.shiftKey ? 40 : 16;
+            let nextWidth = null;
+
+            if (event.key === 'ArrowLeft') {
+                nextWidth = currentWidth - step;
+            } else if (event.key === 'ArrowRight') {
+                nextWidth = currentWidth + step;
+            } else if (event.key === 'Home') {
+                nextWidth = config.min;
+            } else if (event.key === 'End') {
+                nextWidth = getMaxResizablePanelWidth(panelId);
+            }
+
+            if (nextWidth === null) {
+                return;
+            }
+
+            event.preventDefault();
+            applyLayoutPanelWidth(panelId, nextWidth, { persist: true });
+        }
+
+        function createLayoutResizerElement(id, panelId, label) {
+            const resizer = document.createElement('div');
+            resizer.className = 'layout-resizer';
+            resizer.id = id;
+            resizer.dataset.layoutResizer = '';
+            resizer.dataset.resizeTarget = panelId;
+            resizer.setAttribute('role', 'separator');
+            resizer.setAttribute('aria-orientation', 'vertical');
+            resizer.setAttribute('aria-label', label);
+            resizer.tabIndex = 0;
+            return resizer;
+        }
+
+        function ensureLayoutResizerMarkup() {
+            [
+                {
+                    id: 'groupAccountResizer',
+                    panelId: 'groupPanel',
+                    label: '调整分组区域宽度',
+                },
+                {
+                    id: 'accountEmailResizer',
+                    panelId: 'accountPanel',
+                    label: '调整邮箱账号区域宽度',
+                },
+                {
+                    id: 'emailDetailResizer',
+                    panelId: 'emailListPanel',
+                    label: '调整邮件列表区域宽度',
+                },
+            ].forEach(({ id, panelId, label }) => {
+                if (document.getElementById(id)) {
+                    return;
+                }
+
+                const panel = document.getElementById(panelId);
+                if (!panel || !panel.parentNode) {
+                    return;
+                }
+
+                panel.insertAdjacentElement('afterend', createLayoutResizerElement(id, panelId, label));
+            });
+        }
+
+        function initLayoutResizers() {
+            ensureLayoutResizerMarkup();
+            document.querySelectorAll('[data-layout-resizer]').forEach(resizer => {
+                if (resizer.dataset.boundResize === 'true') {
+                    return;
+                }
+                resizer.dataset.boundResize = 'true';
+                resizer.addEventListener('pointerdown', startLayoutResize);
+                resizer.addEventListener('keydown', handleLayoutResizerKeydown);
+            });
+            restoreLayoutPanelWidths();
         }
 
         function bindPersistentButtonHandlers() {

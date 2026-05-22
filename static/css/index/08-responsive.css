@@ -1,29 +1,17 @@
         /* 响应式 */
         @media (max-width: 1200px) {
-            .group-panel {
-                width: 180px;
-            }
-
-            .account-panel {
-                width: 300px;
-            }
-
-            .email-list-panel {
-                width: 340px;
+            .main-container {
+                --group-panel-width: 180px;
+                --account-panel-width: 300px;
+                --email-list-panel-width: 340px;
             }
         }
 
         @media (max-width: 1024px) {
-            .group-panel {
-                width: 160px;
-            }
-
-            .account-panel {
-                width: 260px;
-            }
-
-            .email-list-panel {
-                width: 300px;
+            .main-container {
+                --group-panel-width: 160px;
+                --account-panel-width: 260px;
+                --email-list-panel-width: 300px;
             }
         }
 
@@ -255,6 +243,10 @@
                 z-index: 130;
             }
 
+            .layout-resizer {
+                display: none;
+            }
+
             .email-list-panel,
             .email-detail-panel {
                 width: 100%;
@@ -274,7 +266,7 @@
                 display: none;
             }
 
-            .email-list-panel.hidden + .email-detail-panel {
+            .email-list-panel.hidden + .layout-resizer + .email-detail-panel {
                 display: flex;
                 flex: 1;
             }

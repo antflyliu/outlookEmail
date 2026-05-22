@@ -9,7 +9,7 @@
 
         /* 邮件列表面板 */
         .email-list-panel {
-            width: 400px;
+            width: var(--email-list-panel-width, 400px);
             background-color: #ffffff;
             border-right: 1px solid #e5e5e5;
             display: flex;
@@ -21,6 +21,10 @@
         }
 
         .email-list-panel.hidden {
+            display: none;
+        }
+
+        .email-list-panel.hidden + .layout-resizer {
             display: none;
         }
 
