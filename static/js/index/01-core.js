@@ -1,4 +1,4 @@
-        /* global closeAllModals, debounce, ensureForwardingSettingsUI, handleGlobalGroupPointerMove, handleGlobalGroupPointerUp, initAccountListScroll, initAccountPageSizeSelect, initColorPicker, initEmailListScroll, loadGroups, loadTags, renderEmailList, scheduleEmailListLoadCheck, searchAccounts */
+        /* global closeAllModals, debounce, ensureForwardingSettingsUI, handleGlobalGroupPointerMove, handleGlobalGroupPointerUp, initAccountListScroll, initAccountPageSizeSelect, initAccountSearchScopeSelect, initAccountSelectionGestures, initColorPicker, initEmailListScroll, loadGroups, loadMoreCloudflareGlobalMessages, loadTags, renderEmailList, scheduleEmailListLoadCheck, searchAccounts */
 
         // 全局状态
         let csrfToken = null;
@@ -434,7 +434,8 @@
         }
 
         function canLoadMoreEmails() {
-            if (isLoadingMore || !hasMoreEmails || !currentAccount || isTempEmailGroup) {
+            const isCloudflareGlobalList = currentMethod === 'cloudflare-admin';
+            if (isLoadingMore || !hasMoreEmails || !currentAccount || (isTempEmailGroup && !isCloudflareGlobalList)) {
                 return false;
             }
 
@@ -955,244 +956,6 @@
             scheduleEmailListLoadCheck(0);
         }
 
-        // ==================== CSRF 防护 ====================
-
-        const originalFetch = window.fetch.bind(window);
-
-        // 初始化 CSRF Token
-        async function initCSRFToken(forceRefresh = false) {
-            if (csrfToken && !forceRefresh) {
-                return csrfToken;
-            }
-
-            try {
-                const response = await originalFetch('/api/csrf-token', {
-                    cache: 'no-store',
-                    credentials: 'same-origin',
-                    headers: {
-                        'Cache-Control': 'no-cache'
-                    }
-                });
-                if (!response.ok) {
-                    throw new Error(`CSRF token request failed: ${response.status}`);
-                }
-                const data = await response.json();
-                csrfToken = data.csrf_token || null;
-                if (data.csrf_disabled) {
-                    console.warn('CSRF protection is disabled. Install flask-wtf for better security.');
-                }
-                return csrfToken;
-            } catch (error) {
-                console.error('Failed to initialize CSRF token:', error);
-                return null;
-            }
-        }
-
-        function appendCSRFHeader(options, token) {
-            if (!token) {
-                return;
-            }
-
-            if (options.headers instanceof Headers) {
-                options.headers.set('X-CSRFToken', token);
-                return;
-            }
-
-            options.headers = {
-                ...(options.headers || {}),
-                'X-CSRFToken': token
-            };
-        }
-
-        async function isCSRFFailureResponse(response) {
-            if (!response || response.status !== 400) {
-                return false;
-            }
-
-            try {
-                const contentType = response.headers.get('content-type') || '';
-                if (contentType.includes('application/json')) {
-                    const payload = await response.clone().json();
-                    const errorMessage = String(
-                        payload?.error || payload?.message || payload?.description || ''
-                    );
-                    return Boolean(payload?.csrf_error) || /csrf/i.test(errorMessage);
-                }
-
-                const bodyText = await response.clone().text();
-                return /csrf/i.test(bodyText);
-            } catch (error) {
-                console.warn('Failed to inspect CSRF error response:', error);
-                return false;
-            }
-        }
-
-        async function fetchWithCSRF(url, options = {}, retrying = false) {
-            const requestOptions = {
-                credentials: 'same-origin',
-                ...(options || {})
-            };
-            const method = String(requestOptions.method || 'GET').toUpperCase();
-
-            if (method !== 'GET') {
-                if (!csrfToken) {
-                    await initCSRFToken();
-                }
-                appendCSRFHeader(requestOptions, csrfToken);
-            }
-
-            const response = await originalFetch(url, requestOptions);
-            if (retrying || method === 'GET') {
-                return response;
-            }
-
-            if (await isCSRFFailureResponse(response)) {
-                csrfToken = null;
-                const refreshedToken = await initCSRFToken(true);
-                if (refreshedToken) {
-                    const retryOptions = {
-                        credentials: 'same-origin',
-                        ...(options || {})
-                    };
-                    appendCSRFHeader(retryOptions, refreshedToken);
-                    return fetchWithCSRF(url, retryOptions, true);
-                }
-            }
-
-            return response;
-        }
-
-        // 包装 fetch 请求，自动添加 CSRF Token
-        window.fetch = function (url, options = {}) {
-            return fetchWithCSRF(url, options);
-        };
-
-        async function loadAppTimeZoneFromSettings() {
-            try {
-                const response = await fetch('/api/settings', {
-                    method: 'GET',
-                    cache: 'no-store',
-                    credentials: 'same-origin'
-                });
-                const data = await response.json().catch(() => ({}));
-                if (!response.ok || !data?.success) {
-                    return null;
-                }
-
-                const timeZone = data?.settings?.app_timezone;
-                if (timeZone) {
-                    setAppTimeZone(timeZone);
-                }
-                setShowAccountCreatedAt(String(data?.settings?.show_account_created_at) !== 'false');
-                setShowAccountSortOrder(String(data?.settings?.show_account_sort_order) === 'true');
-                setShowGroupId(String(data?.settings?.show_group_id) !== 'false');
-                return data?.settings || null;
-            } catch (error) {
-                return null;
-            }
-        }
-
-        // 初始化
-        document.addEventListener('DOMContentLoaded', async function () {
-            // 初始化 CSRF Token
-            await initCSRFToken();
-            await loadAppTimeZoneFromSettings();
-            ensureForwardingSettingsUI();
-            bindPersistentButtonHandlers();
-            document.addEventListener('click', closeAccountActionMenus);
-            document.addEventListener('click', handleGlobalChromeClick);
-            document.addEventListener('click', handleGlobalTagFilterClick);
-            document.getElementById('importImapHost')?.addEventListener('input', updateImportHint);
-            document.getElementById('importImapPort')?.addEventListener('input', updateImportHint);
-            document.getElementById('oauthEmailInput')?.addEventListener('input', invalidateRefreshTokenPreview);
-            document.getElementById('oauthPasswordInput')?.addEventListener('input', invalidateRefreshTokenPreview);
-            document.getElementById('redirectUrlInput')?.addEventListener('input', invalidateRefreshTokenPreview);
-            document.getElementById('navbarActionsMenu')?.addEventListener('click', function (event) {
-                if (event.target.closest('.navbar-btn')) {
-                    closeNavbarActionsMenu();
-                }
-            });
-            document.getElementById('mobileNavMenuBtn')?.addEventListener('click', function () {
-                toggleNavbarActionsMenu();
-            });
-            document.getElementById('mobileGroupBtn')?.addEventListener('click', function () {
-                toggleMobilePanel('group');
-            });
-            document.getElementById('mobileAccountBtn')?.addEventListener('click', function () {
-                toggleMobilePanel('account');
-            });
-            document.getElementById('mobileListBtn')?.addEventListener('click', function () {
-                showEmailList();
-            });
-            document.getElementById('mobilePanelScrim')?.addEventListener('click', function () {
-                closeMobilePanels();
-            });
-            window.addEventListener('resize', function () {
-                clearTimeout(responsiveUiResizeTimer);
-                responsiveUiResizeTimer = window.setTimeout(syncResponsiveUI, 120);
-            });
-            document.addEventListener('keydown', function (event) {
-                if (event.key === 'Escape') {
-                    closeVersionPopover();
-                }
-            });
-
-            closeAllModals(); // 修复：应用启动时关闭所有模态框，防止浏览器缓存导致残留的模态框背景层
-            loadVersionStatus();
-            loadDockerUpdateStatus();
-            loadGroups();
-            if (typeof loadTags === 'function') {
-                loadTags();
-            }
-            initColorPicker();
-            initColorPicker();
-            initLayoutResizers();
-            initEmailListScroll();
-            initAccountListScroll();
-            initAccountPageSizeSelect();
-            window.addEventListener('pointermove', handleGlobalGroupPointerMove, { passive: false });
-            window.addEventListener('pointerup', handleGlobalGroupPointerUp);
-            window.addEventListener('pointercancel', handleGlobalGroupPointerUp);
-
-            // 绑定搜索框事件
-            const searchInput = document.getElementById('globalSearch');
-            if (searchInput) {
-                const debouncedSearch = debounce((e) => {
-                    searchAccounts(e.target.value);
-                }, 300);
-                searchInput.addEventListener('input', debouncedSearch);
-            }
-
-            syncResponsiveUI();
-        });
-
-        function closeAccountActionMenus() {
-            document.querySelectorAll('.account-item.menu-open').forEach(item => {
-                item.classList.remove('menu-open');
-            });
-        }
-
-        function closeTagFilterDropdown() {
-            document.getElementById('tagFilterDropdown')?.classList.remove('open');
-        }
-
-        function handleGlobalTagFilterClick(event) {
-            if (!event.target.closest('#tagFilterDropdown')) {
-                closeTagFilterDropdown();
-            }
-        }
-
-        function toggleAccountActionMenu(toggleBtn) {
-            const accountItem = toggleBtn?.closest('.account-item');
-            if (!accountItem) return;
-
-            const shouldOpen = !accountItem.classList.contains('menu-open');
-            closeAccountActionMenus();
-            if (shouldOpen) {
-                accountItem.classList.add('menu-open');
-            }
-        }
-
         function getLayoutResizeRoot() {
             return document.querySelector('.main-container');
         }
@@ -1473,6 +1236,259 @@
             restoreLayoutPanelWidths();
         }
 
+        // ==================== CSRF 防护 ====================
+
+        const originalFetch = window.fetch.bind(window);
+
+        // 初始化 CSRF Token
+        async function initCSRFToken(forceRefresh = false) {
+            if (csrfToken && !forceRefresh) {
+                return csrfToken;
+            }
+
+            try {
+                const response = await originalFetch('/api/csrf-token', {
+                    cache: 'no-store',
+                    credentials: 'same-origin',
+                    headers: {
+                        'Cache-Control': 'no-cache'
+                    }
+                });
+                if (!response.ok) {
+                    throw new Error(`CSRF token request failed: ${response.status}`);
+                }
+                const data = await response.json();
+                csrfToken = data.csrf_token || null;
+                if (data.csrf_disabled) {
+                    console.warn('CSRF protection is disabled. Install flask-wtf for better security.');
+                }
+                return csrfToken;
+            } catch (error) {
+                console.error('Failed to initialize CSRF token:', error);
+                return null;
+            }
+        }
+
+        function appendCSRFHeader(options, token) {
+            if (!token) {
+                return;
+            }
+
+            if (options.headers instanceof Headers) {
+                options.headers.set('X-CSRFToken', token);
+                return;
+            }
+
+            options.headers = {
+                ...(options.headers || {}),
+                'X-CSRFToken': token
+            };
+        }
+
+        async function isCSRFFailureResponse(response) {
+            if (!response || response.status !== 400) {
+                return false;
+            }
+
+            try {
+                const contentType = response.headers.get('content-type') || '';
+                if (contentType.includes('application/json')) {
+                    const payload = await response.clone().json();
+                    const errorMessage = String(
+                        payload?.error || payload?.message || payload?.description || ''
+                    );
+                    return Boolean(payload?.csrf_error) || /csrf/i.test(errorMessage);
+                }
+
+                const bodyText = await response.clone().text();
+                return /csrf/i.test(bodyText);
+            } catch (error) {
+                console.warn('Failed to inspect CSRF error response:', error);
+                return false;
+            }
+        }
+
+        async function fetchWithCSRF(url, options = {}, retrying = false) {
+            const requestOptions = {
+                credentials: 'same-origin',
+                ...(options || {})
+            };
+            const method = String(requestOptions.method || 'GET').toUpperCase();
+
+            if (method !== 'GET') {
+                if (!csrfToken) {
+                    await initCSRFToken();
+                }
+                appendCSRFHeader(requestOptions, csrfToken);
+            }
+
+            const response = await originalFetch(url, requestOptions);
+            if (retrying || method === 'GET') {
+                return response;
+            }
+
+            if (await isCSRFFailureResponse(response)) {
+                csrfToken = null;
+                const refreshedToken = await initCSRFToken(true);
+                if (refreshedToken) {
+                    const retryOptions = {
+                        credentials: 'same-origin',
+                        ...(options || {})
+                    };
+                    appendCSRFHeader(retryOptions, refreshedToken);
+                    return fetchWithCSRF(url, retryOptions, true);
+                }
+            }
+
+            return response;
+        }
+
+        // 包装 fetch 请求，自动添加 CSRF Token
+        window.fetch = function (url, options = {}) {
+            return fetchWithCSRF(url, options);
+        };
+
+        async function loadAppTimeZoneFromSettings() {
+            try {
+                const response = await fetch('/api/settings', {
+                    method: 'GET',
+                    cache: 'no-store',
+                    credentials: 'same-origin'
+                });
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || !data?.success) {
+                    return null;
+                }
+
+                const timeZone = data?.settings?.app_timezone;
+                if (timeZone) {
+                    setAppTimeZone(timeZone);
+                }
+                setShowAccountCreatedAt(String(data?.settings?.show_account_created_at) !== 'false');
+                setShowAccountSortOrder(String(data?.settings?.show_account_sort_order) === 'true');
+                setShowGroupId(String(data?.settings?.show_group_id) !== 'false');
+                return data?.settings || null;
+            } catch (error) {
+                return null;
+            }
+        }
+
+        // 初始化
+        document.addEventListener('DOMContentLoaded', async function () {
+            // 初始化 CSRF Token
+            await initCSRFToken();
+            await loadAppTimeZoneFromSettings();
+            ensureForwardingSettingsUI();
+            bindPersistentButtonHandlers();
+            document.addEventListener('click', closeAccountActionMenus);
+            document.addEventListener('click', handleGlobalChromeClick);
+            document.addEventListener('click', handleGlobalTagFilterClick);
+            document.addEventListener('click', handleGlobalImportTagClick);
+            document.getElementById('importImapHost')?.addEventListener('input', updateImportHint);
+            document.getElementById('importImapPort')?.addEventListener('input', updateImportHint);
+            document.getElementById('oauthEmailInput')?.addEventListener('input', invalidateRefreshTokenPreview);
+            document.getElementById('oauthPasswordInput')?.addEventListener('input', invalidateRefreshTokenPreview);
+            document.getElementById('redirectUrlInput')?.addEventListener('input', invalidateRefreshTokenPreview);
+            document.getElementById('navbarActionsMenu')?.addEventListener('click', function (event) {
+                if (event.target.closest('.navbar-btn')) {
+                    closeNavbarActionsMenu();
+                }
+            });
+            document.getElementById('mobileNavMenuBtn')?.addEventListener('click', function () {
+                toggleNavbarActionsMenu();
+            });
+            document.getElementById('mobileGroupBtn')?.addEventListener('click', function () {
+                toggleMobilePanel('group');
+            });
+            document.getElementById('mobileAccountBtn')?.addEventListener('click', function () {
+                toggleMobilePanel('account');
+            });
+            document.getElementById('mobileListBtn')?.addEventListener('click', function () {
+                showEmailList();
+            });
+            document.getElementById('mobilePanelScrim')?.addEventListener('click', function () {
+                closeMobilePanels();
+            });
+            window.addEventListener('resize', function () {
+                clearTimeout(responsiveUiResizeTimer);
+                responsiveUiResizeTimer = window.setTimeout(syncResponsiveUI, 120);
+            });
+            document.addEventListener('keydown', function (event) {
+                if (event.key === 'Escape') {
+                    closeVersionPopover();
+                }
+            });
+
+            closeAllModals(); // 修复：应用启动时关闭所有模态框，防止浏览器缓存导致残留的模态框背景层
+            loadVersionStatus();
+            loadDockerUpdateStatus();
+            loadGroups();
+            if (typeof loadTags === 'function') {
+                loadTags();
+            }
+            initColorPicker();
+            initColorPicker();
+            initEmailListScroll();
+            initAccountListScroll();
+            initAccountPageSizeSelect();
+            initAccountSearchScopeSelect();
+            initLayoutResizers();
+            if (typeof initAccountSelectionGestures === 'function') {
+                initAccountSelectionGestures();
+            }
+            window.addEventListener('pointermove', handleGlobalGroupPointerMove, { passive: false });
+            window.addEventListener('pointerup', handleGlobalGroupPointerUp);
+            window.addEventListener('pointercancel', handleGlobalGroupPointerUp);
+
+            // 绑定搜索框事件
+            const searchInput = document.getElementById('globalSearch');
+            if (searchInput) {
+                const debouncedSearch = debounce((e) => {
+                    searchAccounts(e.target.value);
+                }, 300);
+                searchInput.addEventListener('input', debouncedSearch);
+            }
+
+            syncResponsiveUI();
+        });
+
+        function closeAccountActionMenus() {
+            document.querySelectorAll('.account-item.menu-open').forEach(item => {
+                item.classList.remove('menu-open');
+            });
+        }
+
+        function closeTagFilterDropdown() {
+            document.getElementById('tagFilterDropdown')?.classList.remove('open');
+        }
+
+        function handleGlobalTagFilterClick(event) {
+            if (!event.target.closest('#tagFilterDropdown')) {
+                closeTagFilterDropdown();
+            }
+        }
+
+        function closeImportTagDropdown() {
+            document.getElementById('importTagDropdown')?.classList.remove('open');
+        }
+
+        function handleGlobalImportTagClick(event) {
+            if (!event.target.closest('#importTagDropdown')) {
+                closeImportTagDropdown();
+            }
+        }
+
+        function toggleAccountActionMenu(toggleBtn) {
+            const accountItem = toggleBtn?.closest('.account-item');
+            if (!accountItem) return;
+
+            const shouldOpen = !accountItem.classList.contains('menu-open');
+            closeAccountActionMenus();
+            if (shouldOpen) {
+                accountItem.classList.add('menu-open');
+            }
+        }
+
         function bindPersistentButtonHandlers() {
             const accountList = document.getElementById('accountList');
             if (accountList && !accountList.dataset.boundActions) {
@@ -1538,6 +1554,12 @@
         // 加载更多邮件
         async function loadMoreEmails() {
             if (isLoadingMore || !hasMoreEmails) return;
+            if (currentMethod === 'cloudflare-admin') {
+                if (typeof loadMoreCloudflareGlobalMessages === 'function') {
+                    return loadMoreCloudflareGlobalMessages();
+                }
+                return;
+            }
 
             isLoadingMore = true;
             const nextSkip = Math.max(Number(currentSkip) || 0, Array.isArray(currentEmails) ? currentEmails.length : 0);

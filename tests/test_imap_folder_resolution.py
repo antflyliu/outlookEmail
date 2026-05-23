@@ -84,6 +84,26 @@ class ImapFolderResolutionTests(unittest.TestCase):
         self.assertEqual(parsed['client_id'], '24d9a0ed-8787-4584-883c-2fd79308940a')
         self.assertEqual(parsed['refresh_token'], '0.AXEA_refresh')
 
+    def test_email_query_candidates_combine_plus_and_gmail_suffix_fallbacks(self):
+        candidates = web_outlook_app.build_email_query_candidates('User+Team+Code@Gmail.com')
+
+        self.assertEqual(candidates, [
+            'user+team+code@gmail.com',
+            'user+team@gmail.com',
+            'user@gmail.com',
+            'user+team+code@googlemail.com',
+            'user+team@googlemail.com',
+            'user@googlemail.com',
+        ])
+
+    def test_email_query_candidates_do_not_add_gmail_suffix_for_other_domains(self):
+        candidates = web_outlook_app.build_email_query_candidates('alias+team@example.com')
+
+        self.assertEqual(candidates, [
+            'alias+team@example.com',
+            'alias@example.com',
+        ])
+
     def test_resolve_126_inbox_from_listed_folder(self):
         mail = FakeMail(
             selectable={'INBOX.收件箱'},
@@ -186,6 +206,57 @@ class ImapFolderResolutionTests(unittest.TestCase):
         self.assertEqual([item['id'] for item in result['emails']], ['1', '2'])
         self.assertEqual(result['emails'][0]['date'], '14-Apr-2026 10:00:00 +0000')
         self.assertTrue(mail.logged_out)
+
+    def test_custom_imap_has_more_tracks_older_pages(self):
+        class PaginatedMail(FakeMail):
+            def uid(self, command, *args, **kwargs):
+                if command == 'SEARCH':
+                    return 'OK', [b' '.join(str(index).encode('utf-8') for index in range(1, 46))]
+                if command == 'FETCH':
+                    uid = args[0]
+                    uid_text = uid.decode('utf-8') if isinstance(uid, (bytes, bytearray)) else str(uid)
+                    minute = int(uid_text) % 60
+                    internal_date = f'14-Apr-2026 08:{minute:02d}:00 +0000'
+                    raw_email = (
+                        f"Subject: page message {uid_text}\r\n"
+                        "From: sender@example.com\r\n"
+                        "To: user@example.com\r\n"
+                        f"Date: Tue, 14 Apr 2026 08:{minute:02d}:00 +0000\r\n"
+                        "\r\n"
+                        "hello\r\n"
+                    ).encode('utf-8')
+                    return 'OK', [(
+                        f'{uid_text} (FLAGS () INTERNALDATE "{internal_date}" RFC822 {{{len(raw_email)}}}'.encode('utf-8'),
+                        raw_email,
+                    )]
+                return super().uid(command, *args, **kwargs)
+
+        def fetch_page(skip):
+            mail = PaginatedMail(selectable={'INBOX'})
+            with patch.object(web_outlook_app, 'create_imap_connection', return_value=mail):
+                result = web_outlook_app.get_emails_imap_generic(
+                    email_addr='user@example.com',
+                    imap_password='secret',
+                    imap_host='imap.example.com',
+                    provider='custom',
+                    folder='inbox',
+                    skip=skip,
+                    top=20,
+                )
+            self.assertTrue(result['success'])
+            self.assertTrue(mail.logged_out)
+            return result
+
+        first_page = fetch_page(0)
+        middle_page = fetch_page(20)
+        final_page = fetch_page(40)
+
+        self.assertEqual(first_page['emails'][0]['id'], '45')
+        self.assertTrue(first_page['has_more'])
+        self.assertEqual(middle_page['emails'][0]['id'], '25')
+        self.assertTrue(middle_page['has_more'])
+        self.assertEqual(final_page['emails'][0]['id'], '5')
+        self.assertFalse(final_page['has_more'])
 
     def test_gmail_imap_list_reads_seen_flag_from_split_fetch_response(self):
         raw_email = (
@@ -622,6 +693,14 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertFalse(payload['success'])
         self.assertIn('API Key', payload['error'])
 
+    def test_external_accounts_accepts_api_token_query_alias(self):
+        response = self.client.get('/api/external/accounts?api_token=test-external-key')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['total'], 1)
+
     def test_external_emails_requires_api_key(self):
         response = self.client.get('/api/external/emails?email=user@outlook.com&folder=inbox')
 
@@ -629,50 +708,6 @@ class ExternalAccountsApiTests(unittest.TestCase):
         payload = response.get_json()
         self.assertFalse(payload['success'])
         self.assertIn('API Key', payload['error'])
-
-    def test_external_accounts_accepts_api_token_query_alias(self):
-        response = self.client.get('/api/external/accounts?group_id=1&api_token=test-external-key')
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload['success'])
-        self.assertEqual(payload['total'], 1)
-
-    def test_external_batch_update_group_requires_api_key(self):
-        response = self.client.post('/api/external/accounts/batch-update-group', json={
-            'email': 'user@outlook.com',
-            'group_id': 1,
-        })
-
-        self.assertEqual(response.status_code, 401)
-        payload = response.get_json()
-        self.assertFalse(payload['success'])
-        self.assertIn('API Key', payload['error'])
-
-    def test_external_batch_update_group_moves_account_by_email(self):
-        with self.app.app_context():
-            target_group_id = web_outlook_app.add_group('订阅成功', '已订阅账号', '#16a34a')
-            self.assertIsNotNone(target_group_id)
-
-        response = self.client.post(
-            '/api/external/accounts/batch-update-group',
-            headers={'X-API-Key': 'test-external-key'},
-            json={
-                'email': 'user@outlook.com',
-                'from_group_id': 1,
-                'group_id': target_group_id,
-            }
-        )
-
-        self.assertEqual(response.status_code, 200)
-        payload = response.get_json()
-        self.assertTrue(payload['success'])
-        self.assertEqual(payload['group_id'], target_group_id)
-        self.assertEqual(payload['moved_count'], 1)
-
-        with self.app.app_context():
-            account = web_outlook_app.get_account_by_email('user@outlook.com')
-        self.assertEqual(account['group_id'], target_group_id)
 
     def test_internal_emails_requires_login(self):
         response = self.client.get('/api/emails/user@outlook.com?folder=inbox')
@@ -845,6 +880,9 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['requested_email'], 'alias+team+notice@example.com')
         self.assertEqual(payload['resolved_email'], 'user@outlook.com')
         self.assertEqual(payload['matched_alias'], 'alias+team@example.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'alias+team@example.com')
+        self.assertEqual(payload['resolved_query_email'], 'alias+team@example.com')
 
         called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
         self.assertEqual(called_account['email'], 'user@outlook.com')
@@ -941,6 +979,31 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertNotIn('client_id', account)
         self.assertNotIn('imap_host', account)
         self.assertNotIn('imap_port', account)
+
+    def test_external_batch_update_group_moves_account_by_email(self):
+        with self.app.app_context():
+            target_group_id = web_outlook_app.add_group('外部目标组', 'api move target', '#654321')
+            self.assertIsNotNone(target_group_id)
+
+        response = self.client.post(
+            '/api/external/accounts/batch-update-group',
+            headers={'X-API-Key': 'test-external-key'},
+            json={
+                'email': 'alias@example.com',
+                'from_group_id': 1,
+                'group_id': target_group_id,
+            },
+        )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'], msg=payload.get('error'))
+        self.assertEqual(payload['moved_count'], 1)
+        self.assertEqual(payload['group_id'], target_group_id)
+
+        with self.app.app_context():
+            moved = web_outlook_app.get_account_by_email('user@outlook.com')
+        self.assertEqual(moved['group_id'], target_group_id)
 
     def test_external_emails_supports_all_folder(self):
         expected_result = {
@@ -1064,6 +1127,9 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertEqual(payload['requested_email'], 'alias+team+notice@example.com')
         self.assertEqual(payload['resolved_email'], 'user@outlook.com')
         self.assertEqual(payload['matched_alias'], 'alias+team@example.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'alias+team@example.com')
+        self.assertEqual(payload['resolved_query_email'], 'alias+team@example.com')
 
         called_account, called_folder, called_skip, called_top = fetch_mock.call_args.args
         self.assertEqual(called_account['email'], 'user@outlook.com')
@@ -1071,6 +1137,164 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertEqual(called_folder, 'inbox')
         self.assertEqual(called_skip, 0)
         self.assertEqual(called_top, 1)
+
+    def test_external_emails_gmail_suffix_falls_back_to_googlemail_account(self):
+        with self.app.app_context():
+            added = web_outlook_app.add_account(
+                'person@googlemail.com',
+                'password123',
+                '24d9a0ed-8787-4584-883c-2fd79308940b',
+                '0.AXEA_googlemail_refresh',
+                group_id=1,
+                remark='googlemail account',
+            )
+            self.assertTrue(added)
+
+        expected_result = {
+            'success': True,
+            'emails': [{'id': 'gmail-fallback', 'folder': 'inbox', 'date': '2026-01-05T00:00:00Z'}],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result) as fetch_mock:
+            response = self.client.get(
+                '/api/external/emails?email=person@gmail.com&folder=inbox&top=1',
+                headers={'X-API-Key': 'test-external-key'}
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'person@gmail.com')
+        self.assertEqual(payload['resolved_email'], 'person@googlemail.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertEqual(payload['fallback_email'], 'person@googlemail.com')
+        self.assertEqual(payload['resolved_query_email'], 'person@googlemail.com')
+
+        called_account = fetch_mock.call_args.args[0]
+        self.assertEqual(called_account['email'], 'person@googlemail.com')
+
+    def test_cloudflare_global_messages_lists_without_address_filter(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: target@example.com\r\n"
+            "Subject: Cloudflare code\r\n"
+            "Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            "\r\n"
+            "Your code is 123456"
+        )
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', return_value={
+            'success': True,
+            'messages': [{
+                'id': 123,
+                'address': 'target@example.com',
+                'source': 'sender@example.com',
+                'raw': raw_message,
+                'created_at': '2026-04-14T08:20:50Z',
+            }],
+            'count': 1,
+        }) as cloudflare_mock:
+            response = self.client.get('/api/cloudflare/messages?limit=200&offset=0')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['limit'], 100)
+        self.assertEqual(payload['queried_email'], '')
+        self.assertFalse(payload['fallback_used'])
+        self.assertEqual(payload['count'], 1)
+        self.assertEqual(payload['emails'][0]['to'], 'target@example.com')
+        self.assertEqual(payload['emails'][0]['subject'], 'Cloudflare code')
+        cloudflare_mock.assert_called_once_with(limit=100, offset=0, address='')
+
+    def test_cloudflare_global_messages_falls_back_between_gmail_suffixes(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: user@googlemail.com\r\n"
+            "Subject: Googlemail code\r\n"
+            "Date: Tue, 14 Apr 2026 08:20:50 +0000\r\n"
+            "\r\n"
+            "Your code is 654321"
+        )
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', side_effect=[
+            {'success': True, 'messages': [], 'count': 0},
+            {
+                'success': True,
+                'messages': [{
+                    'id': 456,
+                    'address': 'user@googlemail.com',
+                    'source': 'sender@example.com',
+                    'raw': raw_message,
+                    'created_at': '2026-04-14T08:20:50Z',
+                }],
+                'count': 1,
+            },
+        ]) as cloudflare_mock:
+            response = self.client.get('/api/cloudflare/messages?address=user@gmail.com&limit=20&offset=0')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['requested_email'], 'user@gmail.com')
+        self.assertEqual(payload['queried_email'], 'user@googlemail.com')
+        self.assertTrue(payload['fallback_used'])
+        self.assertTrue(payload['fallback_attempted'])
+        self.assertEqual(payload['emails'][0]['to'], 'user@googlemail.com')
+        self.assertEqual(
+            [call.kwargs['address'] for call in cloudflare_mock.call_args_list],
+            ['user@gmail.com', 'user@googlemail.com']
+        )
+
+    def test_cloudflare_global_messages_do_not_write_temp_tables(self):
+        raw_message = (
+            "From: Sender <sender@example.com>\r\n"
+            "To: imported-nowhere@example.com\r\n"
+            "Subject: No local temp mailbox\r\n"
+            "\r\n"
+            "Body"
+        )
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute('DELETE FROM temp_email_tags')
+            db.execute('DELETE FROM temp_email_messages')
+            db.execute('DELETE FROM temp_emails')
+            db.commit()
+
+        with self.client.session_transaction() as session:
+            session['logged_in'] = True
+
+        with patch.object(web_outlook_app, 'cloudflare_get_admin_messages', return_value={
+            'success': True,
+            'messages': [{
+                'id': 789,
+                'address': 'imported-nowhere@example.com',
+                'raw': raw_message,
+            }],
+            'count': 1,
+        }):
+            response = self.client.get('/api/cloudflare/messages')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['emails'][0]['to'], 'imported-nowhere@example.com')
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            temp_email_count = db.execute('SELECT COUNT(*) AS count FROM temp_emails').fetchone()['count']
+            temp_message_count = db.execute('SELECT COUNT(*) AS count FROM temp_email_messages').fetchone()['count']
+        self.assertEqual(temp_email_count, 0)
+        self.assertEqual(temp_message_count, 0)
 
 
 class BatchForwardingApiTests(unittest.TestCase):
@@ -1384,6 +1608,189 @@ class RefreshTokenProxyFallbackTests(unittest.TestCase):
         self.assertIsNotNone(log_row)
         self.assertEqual(log_row['status'], 'success')
         self.assertIsNone(log_row['error_message'])
+
+    def test_refresh_account_uses_delegated_graph_scope_before_default_scope(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'access_token': 'access-token'}
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        request_data = mocked_request.call_args.kwargs['data']
+        self.assertIn('https://graph.microsoft.com/Mail.Read', request_data['scope'])
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data['scope'])
+        self.assertIn('offline_access', request_data['scope'])
+        self.assertNotEqual(request_data['scope'], 'https://graph.microsoft.com/.default')
+
+    def test_refresh_account_falls_back_to_original_scope_after_aadsts90023(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        no_permissions_response = FakeResponse(400, {
+            'error': 'invalid_request',
+            'error_description': 'AADSTS90023: No applicable permissions were found for this user.',
+        })
+        success_response = FakeResponse(200, {
+            'access_token': 'access-token',
+            'refresh_token': 'M.C556_SN1.0.U.rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                no_permissions_response,
+                no_permissions_response,
+                no_permissions_response,
+                success_response,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_data = [call.kwargs['data'] for call in mocked_request.call_args_list]
+        self.assertIn('scope', request_data[0])
+        self.assertIn('scope', request_data[1])
+        self.assertEqual(request_data[2]['scope'], 'https://graph.microsoft.com/.default')
+        self.assertNotIn('scope', request_data[3])
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.rotated')
+
+    def test_refresh_account_falls_back_to_default_scope_after_aadsts70000(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        unauthorized_scope_response = FakeResponse(400, {
+            'error': 'invalid_grant',
+            'error_description': (
+                'AADSTS70000: The request was denied because one or more scopes requested '
+                'are unauthorized or expired. The user must first sign in and grant the '
+                'client application access to the requested scope.'
+            ),
+        })
+        success_response = FakeResponse(200, {
+            'access_token': 'access-token',
+            'refresh_token': 'M.C556_SN1.0.U.default-rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                unauthorized_scope_response,
+                unauthorized_scope_response,
+                success_response,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_data = [call.kwargs['data'] for call in mocked_request.call_args_list]
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data[0]['scope'])
+        self.assertNotIn('https://graph.microsoft.com/Mail.ReadWrite', request_data[1]['scope'])
+        self.assertEqual(request_data[2]['scope'], 'https://graph.microsoft.com/.default')
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.default-rotated')
+
+    def test_refresh_account_falls_back_to_imap_after_graph_refresh_fails(self):
+        class FakeResponse:
+            def __init__(self, status_code, payload):
+                self.status_code = status_code
+                self._payload = payload
+
+            def json(self):
+                return self._payload
+
+        graph_failure = FakeResponse(400, {
+            'error': 'invalid_grant',
+            'error_description': (
+                'AADSTS70000: The request was denied because one or more scopes requested '
+                'are unauthorized or expired.'
+            ),
+        })
+        imap_success = FakeResponse(200, {
+            'access_token': 'imap-access-token',
+            'refresh_token': 'M.C556_SN1.0.U.imap-rotated',
+        })
+
+        with patch.object(
+            web_outlook_app.requests,
+            'request',
+            side_effect=[
+                graph_failure,
+                graph_failure,
+                graph_failure,
+                graph_failure,
+                imap_success,
+            ],
+        ) as mocked_request:
+            response = self.client.post(f'/api/accounts/{self.account_id}/refresh')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+
+        request_urls = [call.args[1] for call in mocked_request.call_args_list]
+        self.assertEqual(request_urls[:4], [web_outlook_app.TOKEN_URL_GRAPH] * 4)
+        self.assertEqual(request_urls[4], web_outlook_app.TOKEN_URL_IMAP)
+
+        imap_request_data = mocked_request.call_args_list[4].kwargs['data']
+        self.assertEqual(imap_request_data['scope'], web_outlook_app.IMAP_TOKEN_SCOPE)
+
+        with self.app.app_context():
+            refreshed = web_outlook_app.get_account_by_id(self.account_id)
+
+        self.assertIsNotNone(refreshed)
+        self.assertEqual(refreshed['refresh_token'], 'M.C556_SN1.0.U.imap-rotated')
+
+    def test_graph_access_token_uses_delegated_scope_before_default_scope(self):
+        class FakeResponse:
+            status_code = 200
+
+            @staticmethod
+            def json():
+                return {'access_token': 'access-token'}
+
+        with patch.object(web_outlook_app.requests, 'request', return_value=FakeResponse()) as mocked_request:
+            result = web_outlook_app.get_access_token_graph_result('client-id', 'refresh-token')
+
+        self.assertTrue(result['success'])
+        self.assertEqual(result['access_token'], 'access-token')
+        request_data = mocked_request.call_args.kwargs['data']
+        self.assertIn('https://graph.microsoft.com/Mail.Read', request_data['scope'])
+        self.assertIn('https://graph.microsoft.com/Mail.ReadWrite', request_data['scope'])
+        self.assertNotEqual(request_data['scope'], 'https://graph.microsoft.com/.default')
 
     def test_refresh_account_persists_rotated_refresh_token(self):
         class FakeResponse:

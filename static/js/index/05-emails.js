@@ -1,4 +1,4 @@
-        /* global EMAIL_DETAIL_REQUEST_TIMEOUT_MS, EMAIL_LIST_REQUEST_TIMEOUT_MS, adjustIframeHeight, applyEmailListCache, closeMobilePanels, closeNavbarActionsMenu, copyCurrentEmail, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentMethod, currentSkip, emailListCache, escapeHtml, fetchWithTimeout, formatDate, getEmailListCacheEntry, getFolderDisplayName, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, invalidateEmailListCache, isTempEmailGroup, isTimeoutAbortError, normalizeFolderSummaries, renderEmptyStateMarkup, scheduleEmailListLoadCheck, showMobileEmailDetail, showToast, updateMobileContext, updateModalBodyState */
+        /* global EMAIL_DETAIL_REQUEST_TIMEOUT_MS, EMAIL_LIST_REQUEST_TIMEOUT_MS, adjustIframeHeight, applyEmailListCache, closeMobilePanels, closeNavbarActionsMenu, copyCurrentEmail, currentAccount, currentEmailDetail, currentEmailId, currentEmails, currentFolder, currentMethod, currentSkip, emailListCache, escapeHtml, fetchWithTimeout, formatDate, getEmailListCacheEntry, getFolderDisplayName, getNextEmailSkipFromCache, handleApiError, hasMoreEmails, invalidateEmailListCache, isTempEmailGroup, isTimeoutAbortError, loadCloudflareGlobalMessages, normalizeFolderSummaries, renderCloudflareGlobalFilterBar, renderEmptyStateMarkup, scheduleEmailListLoadCheck, showMobileEmailDetail, showToast, updateMobileContext, updateModalBodyState */
 
         // ==================== 邮件相关 ====================
 
@@ -116,7 +116,7 @@
         let isBatchSelectMode = false;
 
         function getRecipientDisplayLabel(emailItem) {
-            if (isTempEmailGroup) {
+            if (isTempEmailGroup && currentMethod !== 'cloudflare-admin') {
                 return '';
             }
 
@@ -139,6 +139,9 @@
         }
 
         function getEmailSourceLabel(emailItem) {
+            if (currentMethod === 'cloudflare-admin') {
+                return 'Cloudflare';
+            }
             if (isTempEmailGroup || currentFolder !== 'all' || !emailItem?.folder) {
                 return '';
             }
@@ -311,7 +314,10 @@
                 const emptyStateText = isTempEmailGroup
                     ? '暂无邮件'
                     : `${getFolderDisplayName(currentFolder)}为空`;
-                container.innerHTML = renderEmptyStateMarkup('📭', emptyStateText, {
+                const emptyPrefix = currentMethod === 'cloudflare-admin' && typeof renderCloudflareGlobalFilterBar === 'function'
+                    ? renderCloudflareGlobalFilterBar()
+                    : '';
+                container.innerHTML = emptyPrefix + renderEmptyStateMarkup('📭', emptyStateText, {
                     onAction: 'refreshEmails()',
                     actionTitle: '刷新邮件列表'
                 });
@@ -323,9 +329,14 @@
             }
 
             // 根据是否是临时邮箱选择不同的点击处理函数
-            const clickHandler = isTempEmailGroup ? 'getTempEmailDetail' : 'selectEmail';
+            const clickHandler = currentMethod === 'cloudflare-admin'
+                ? 'getCloudflareGlobalMessageDetail'
+                : (isTempEmailGroup ? 'getTempEmailDetail' : 'selectEmail');
+            const listPrefix = currentMethod === 'cloudflare-admin' && typeof renderCloudflareGlobalFilterBar === 'function'
+                ? renderCloudflareGlobalFilterBar()
+                : '';
 
-            container.innerHTML = emails.map((email, index) => {
+            container.innerHTML = listPrefix + emails.map((email, index) => {
                 const isChecked = selectedEmailIds.has(email.id);
                 const isActive = currentEmailId === email.id;
                 const recipientDisplayLabel = getRecipientDisplayLabel(email);
@@ -917,9 +928,11 @@
             if (isListVisible) {
                 panel.classList.remove('hidden');
                 toggleText.textContent = '隐藏列表';
+                restoreLayoutPanelWidths();
             } else {
                 panel.classList.add('hidden');
                 toggleText.textContent = '显示列表';
+                stopLayoutResize();
             }
 
             closeMobilePanels();
@@ -929,6 +942,8 @@
 
         // 全屏查看邮件
         let currentFullscreenEmail = null;
+        let currentRawEmailSource = '';
+        let currentRawEmailFilename = 'message.eml';
 
         function openFullscreenEmail() {
             const emailDetail = document.getElementById('emailDetail');
@@ -1022,6 +1037,93 @@
             updateModalBodyState();
         }
 
+        async function openRawEmailModal() {
+            if (!currentEmailDetail || !currentEmailDetail.id || !currentAccount) {
+                showToast('请先选择一封邮件', 'warning');
+                return;
+            }
+
+            const modal = document.getElementById('rawEmailModal');
+            const content = document.getElementById('rawEmailContent');
+            const title = document.getElementById('rawEmailTitle');
+            const warning = document.getElementById('rawEmailWarning');
+            if (!modal || !content) return;
+
+            currentRawEmailSource = '';
+            currentRawEmailFilename = `${currentEmailDetail.id || 'message'}.eml`;
+            title.textContent = currentEmailDetail.subject ? `原始邮件：${currentEmailDetail.subject}` : '原始邮件';
+            warning.textContent = '原始邮件包含完整邮件头和路由信息，请谨慎分享。';
+            content.textContent = '正在加载原始邮件源码...';
+            modal.classList.add('show');
+            updateModalBodyState();
+
+            const folder = encodeURIComponent(currentEmailDetail.folder || currentFolder || 'inbox');
+            const method = encodeURIComponent(currentMethod || 'graph');
+            try {
+                const response = await fetchWithTimeout(
+                    `/api/email/${encodeURIComponent(currentAccount)}/${encodeURIComponent(currentEmailDetail.id)}/raw?method=${method}&folder=${folder}`,
+                    {
+                        timeoutMs: EMAIL_DETAIL_REQUEST_TIMEOUT_MS,
+                        timeoutMessage: '加载原始邮件超时，请稍后重试'
+                    }
+                );
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, '加载原始邮件失败');
+                    content.textContent = data.error && data.error.message ? data.error.message : (data.error || '加载原始邮件失败');
+                    return;
+                }
+                currentRawEmailSource = data.raw || '';
+                currentRawEmailFilename = data.filename || currentRawEmailFilename;
+                if (data.warning) {
+                    warning.textContent = data.warning;
+                }
+                content.textContent = currentRawEmailSource || '原始邮件为空';
+            } catch (error) {
+                const errorMessage = isTimeoutAbortError(error)
+                    ? '加载原始邮件超时，请重试'
+                    : '网络错误，请重试';
+                content.textContent = errorMessage;
+                showToast(errorMessage, 'error');
+            }
+        }
+
+        function closeRawEmailModal() {
+            const modal = document.getElementById('rawEmailModal');
+            if (!modal) return;
+            modal.classList.remove('show');
+            updateModalBodyState();
+        }
+
+        function closeRawEmailOnBackdrop(event) {
+            if (event.target.id === 'rawEmailModal') {
+                closeRawEmailModal();
+            }
+        }
+
+        async function copyRawEmailSource() {
+            if (!currentRawEmailSource) {
+                showToast('暂无可复制的原始邮件内容', 'warning');
+                return;
+            }
+            try {
+                await navigator.clipboard.writeText(currentRawEmailSource);
+                showToast('原始邮件已复制');
+            } catch (error) {
+                showToast('复制失败，请手动选择复制', 'error');
+            }
+        }
+
+        function downloadRawEmailSource() {
+            if (!currentRawEmailSource) {
+                showToast('暂无可下载的原始邮件内容', 'warning');
+                return;
+            }
+            const blob = new Blob([currentRawEmailSource], { type: 'message/rfc822;charset=utf-8' });
+            triggerAttachmentDownload(blob, currentRawEmailFilename || 'message.eml');
+            showToast('原始邮件下载已开始');
+        }
+
         function closeFullscreenEmailOnBackdrop(event) {
             // 只有点击背景时才关闭，点击内容区域不关闭
             if (event.target.id === 'fullscreenEmailModal') {
@@ -1080,6 +1182,7 @@
             document.getElementById('emailListPanel').classList.remove('hidden');
             isListVisible = true;
             document.getElementById('toggleListText').textContent = '隐藏列表';
+            restoreLayoutPanelWidths();
             closeMobilePanels();
             closeNavbarActionsMenu();
             updateMobileContext();
@@ -1092,7 +1195,11 @@
         function refreshEmails() {
             if (currentAccount) {
                 if (isTempEmailGroup) {
-                    loadTempEmailMessages(currentAccount);
+                    if (currentMethod === 'cloudflare-admin') {
+                        loadCloudflareGlobalMessages();
+                    } else {
+                        loadTempEmailMessages(currentAccount);
+                    }
                 } else {
                     // 清除当前缓存并强制刷新
                     invalidateEmailListCache(currentAccount, currentFolder);

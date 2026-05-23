@@ -134,6 +134,98 @@ def post_with_proxy_fallback(url: str, *, proxy_url: str = None,
     )
 
 
+GRAPH_DEFAULT_TOKEN_SCOPE = "https://graph.microsoft.com/.default"
+
+
+def build_graph_refresh_scope(graph_scopes: List[str]) -> str:
+    scopes = [scope for scope in graph_scopes if scope]
+    if 'offline_access' in OAUTH_SCOPES:
+        scopes.append('offline_access')
+    return ' '.join(scopes)
+
+
+def get_graph_token_scope_candidates(include_original_scope_fallback: bool = False) -> List[tuple[str, str]]:
+    configured_graph_scopes = [
+        scope for scope in OAUTH_SCOPES
+        if str(scope or '').startswith('https://graph.microsoft.com/')
+    ]
+    read_graph_scopes = [
+        scope for scope in configured_graph_scopes
+        if scope != 'https://graph.microsoft.com/Mail.ReadWrite'
+    ]
+    raw_candidates = [
+        ('configured', build_graph_refresh_scope(configured_graph_scopes)),
+        ('read', build_graph_refresh_scope(read_graph_scopes)),
+        ('default', GRAPH_DEFAULT_TOKEN_SCOPE),
+    ]
+    if include_original_scope_fallback:
+        raw_candidates.append(('original', ''))
+
+    candidates = []
+    seen_scopes = set()
+    for label, scope in raw_candidates:
+        if scope in seen_scopes:
+            continue
+        seen_scopes.add(scope)
+        candidates.append((label, scope))
+    return candidates
+
+
+def is_graph_token_scope_retryable_response(response) -> bool:
+    if response.status_code not in {400, 401, 403}:
+        return False
+    details = get_response_details(response)
+    if isinstance(details, dict):
+        error_code = str(details.get('error') or '').strip().lower()
+        details_text = json.dumps(details, ensure_ascii=True).lower()
+    else:
+        error_code = ''
+        details_text = str(details or '').lower()
+
+    if error_code in {'invalid_scope', 'consent_required', 'interaction_required'}:
+        return True
+    return any(marker in details_text for marker in (
+        'aadsts90023',
+        'aadsts70000',
+        'aadsts70011',
+        'no applicable permissions',
+        'requested are unauthorized or expired',
+        'consent',
+        'invalid scope',
+    ))
+
+
+def request_graph_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
+                                 fallback_proxy_urls: Optional[List[str]] = None,
+                                 include_original_scope_fallback: bool = False):
+    """请求 Graph token，优先使用授权时的显式委托 scope，避免 .default 依赖应用预配置权限。"""
+    last_response = None
+    candidates = get_graph_token_scope_candidates(include_original_scope_fallback)
+    for index, (_label, scope) in enumerate(candidates):
+        data = {
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+        }
+        if scope:
+            data["scope"] = scope
+
+        response = post_with_proxy_fallback(
+            TOKEN_URL_GRAPH,
+            data=data,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            proxy_url=proxy_url,
+            fallback_proxy_urls=fallback_proxy_urls,
+        )
+        last_response = response
+        if response.status_code == 200:
+            return response
+        if index == len(candidates) - 1 or not is_graph_token_scope_retryable_response(response):
+            return response
+
+    return last_response
+
+
 def get_with_proxy_fallback(url: str, *, proxy_url: str = None,
                             fallback_proxy_urls: Optional[List[str]] = None, **kwargs):
     return request_with_proxy_failover(
@@ -191,17 +283,11 @@ def get_access_token_graph_result(client_id: str, refresh_token: str, proxy_url:
                                   fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 Graph API access_token（包含错误详情）"""
     try:
-        res = post_with_proxy_fallback(
-            TOKEN_URL_GRAPH,
-            data={
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": "https://graph.microsoft.com/.default"
-            },
-            timeout=HTTP_REQUEST_TIMEOUT,
-            proxy_url=proxy_url,
-            fallback_proxy_urls=fallback_proxy_urls,
+        res = request_graph_token_response(
+            client_id,
+            refresh_token,
+            proxy_url,
+            fallback_proxy_urls,
         )
 
         if res.status_code != 200:
@@ -321,6 +407,32 @@ def get_emails_graph(client_id: str, refresh_token: str, folder: str = 'inbox', 
                 str(exc)
             )
         }
+
+
+def get_raw_email_graph(client_id: str, refresh_token: str, message_id: str, proxy_url: str = None,
+                        fallback_proxy_urls: Optional[List[str]] = None) -> Optional[bytes]:
+    """使用 Graph API 获取原始 MIME 邮件源码。"""
+    access_token = get_access_token_graph(client_id, refresh_token, proxy_url, fallback_proxy_urls)
+    if not access_token:
+        return None
+
+    try:
+        url = f"https://graph.microsoft.com/v1.0/me/messages/{message_id}/$value"
+        headers = {
+            "Authorization": f"Bearer {access_token}",
+        }
+        res = get_with_proxy_fallback(
+            url,
+            headers=headers,
+            timeout=HTTP_REQUEST_TIMEOUT,
+            proxy_url=proxy_url,
+            fallback_proxy_urls=fallback_proxy_urls,
+        )
+        if res.status_code != 200:
+            return None
+        return res.content
+    except Exception:
+        return None
 
 
 def get_email_detail_graph(client_id: str, refresh_token: str, message_id: str, proxy_url: str = None,
@@ -611,22 +723,30 @@ def download_email_attachment_graph_result(client_id: str, refresh_token: str, m
 
 # ==================== IMAP 方式 ====================
 
+IMAP_TOKEN_SCOPE = "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
+
+
+def request_imap_token_response(client_id: str, refresh_token: str, proxy_url: str = None,
+                                fallback_proxy_urls: Optional[List[str]] = None):
+    return post_with_proxy_fallback(
+        TOKEN_URL_IMAP,
+        data={
+            "client_id": client_id,
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "scope": IMAP_TOKEN_SCOPE
+        },
+        timeout=HTTP_REQUEST_TIMEOUT,
+        proxy_url=proxy_url,
+        fallback_proxy_urls=fallback_proxy_urls,
+    )
+
+
 def get_access_token_imap_result(client_id: str, refresh_token: str, proxy_url: str = None,
                                  fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     """获取 IMAP access_token（包含错误详情）"""
     try:
-        res = post_with_proxy_fallback(
-            TOKEN_URL_IMAP,
-            data={
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": "https://outlook.office.com/IMAP.AccessAsUser.All offline_access"
-            },
-            timeout=HTTP_REQUEST_TIMEOUT,
-            proxy_url=proxy_url,
-            fallback_proxy_urls=fallback_proxy_urls,
-        )
+        res = request_imap_token_response(client_id, refresh_token, proxy_url, fallback_proxy_urls)
 
         if res.status_code != 200:
             details = get_response_details(res)
@@ -797,6 +917,39 @@ def get_emails_imap_with_server(account: str, client_id: str, refresh_token: str
                 pass
 
 
+def get_raw_email_imap(account: str, client_id: str, refresh_token: str, message_id: str,
+                       folder: str = 'inbox', proxy_url: str = None,
+                       fallback_proxy_urls: Optional[List[str]] = None) -> Optional[bytes]:
+    """使用 Outlook IMAP 获取原始 MIME 邮件源码。"""
+    access_token = get_access_token_imap(client_id, refresh_token, proxy_url, fallback_proxy_urls)
+    if not access_token:
+        return None
+
+    connection = None
+    try:
+        with proxy_socket_context(proxy_url):
+            connection = imaplib.IMAP4_SSL(IMAP_SERVER_NEW, IMAP_PORT, timeout=IMAP_TIMEOUT)
+        auth_string = f"user={account}\1auth=Bearer {access_token}\1\1".encode('utf-8')
+        connection.authenticate('XOAUTH2', lambda x: auth_string)
+
+        selected_folder, _ = resolve_imap_folder(connection, 'outlook', folder, readonly=True)
+        if not selected_folder:
+            return None
+
+        status, msg_data = connection.fetch(message_id.encode() if isinstance(message_id, str) else message_id, '(RFC822)')
+        if status != 'OK' or not msg_data or not msg_data[0]:
+            return None
+        return msg_data[0][1]
+    except Exception:
+        return None
+    finally:
+        if connection:
+            try:
+                connection.logout()
+            except Exception:
+                pass
+
+
 def get_email_detail_imap(account: str, client_id: str, refresh_token: str, message_id: str,
                           folder: str = 'inbox', proxy_url: str = None,
                           fallback_proxy_urls: Optional[List[str]] = None) -> Optional[Dict]:
@@ -948,6 +1101,40 @@ def get_message_attachment_by_id(msg, attachment_id: str) -> Optional[Dict[str, 
         if attachment.get('id') == attachment_id:
             return attachment
     return None
+
+
+def get_raw_email_imap_generic(email_addr: str, imap_password: str, imap_host: str,
+                               imap_port: int, message_id: str, folder: str = 'inbox',
+                               provider: str = 'custom', proxy_url: str = '') -> Optional[bytes]:
+    """使用通用 IMAP 获取原始 MIME 邮件源码。"""
+    if not message_id:
+        return None
+
+    connection = None
+    try:
+        connection = create_imap_connection(imap_host, imap_port, proxy_url)
+        connection.login(email_addr, imap_password)
+        selected_folder, search_mode = resolve_imap_folder(connection, provider, folder, readonly=True)
+        if not selected_folder:
+            return None
+
+        status, msg_data = fetch_imap_message_by_id(
+            connection,
+            str(message_id),
+            '(RFC822)',
+            preferred_mode='uid' if search_mode == 'uid' else (search_mode or 'uid')
+        )
+        if status != 'OK' or not msg_data or not msg_data[0]:
+            return None
+        return msg_data[0][1]
+    except Exception:
+        return None
+    finally:
+        if connection:
+            try:
+                connection.logout()
+            except Exception:
+                pass
 
 
 def build_email_detail_from_message(msg, message_id: str, date_value: str = '') -> Dict[str, Any]:
@@ -1654,7 +1841,7 @@ def get_emails_imap_generic(email_addr: str, imap_password: str, imap_host: str,
             'success': True,
             'emails': emails_data,
             'method': 'IMAP (Generic)',
-            'has_more': total > end_idx
+            'has_more': start_idx > 0
         }
     except Exception as exc:
         return {

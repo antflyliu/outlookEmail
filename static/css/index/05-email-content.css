@@ -115,6 +115,63 @@
             padding-bottom: 88px;
         }
 
+        .cloudflare-global-filter {
+            display: grid;
+            grid-template-columns: minmax(0, 1fr) auto auto;
+            gap: 8px;
+            margin: 0 12px 10px;
+            padding: 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 8px;
+            background: #ffffff;
+        }
+
+        .cloudflare-global-filter-input {
+            min-width: 0;
+            height: 34px;
+            padding: 0 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            color: #111827;
+            background: #ffffff;
+        }
+
+        .cloudflare-global-filter-input:focus {
+            outline: none;
+            border-color: #f48120;
+            box-shadow: 0 0 0 2px rgba(244, 129, 32, 0.14);
+        }
+
+        .cloudflare-global-filter-btn {
+            height: 34px;
+            padding: 0 12px;
+            border: 1px solid #f48120;
+            border-radius: 6px;
+            background: #f48120;
+            color: #ffffff;
+            font-size: 13px;
+            font-weight: 600;
+            cursor: pointer;
+            white-space: nowrap;
+        }
+
+        .cloudflare-global-filter-btn.secondary {
+            background: #ffffff;
+            color: #374151;
+            border-color: #d1d5db;
+        }
+
+        .cloudflare-global-account-item {
+            grid-template-columns: minmax(0, 1fr);
+        }
+
+        .cloudflare-global-account-title {
+            overflow: visible;
+            text-overflow: clip;
+            white-space: nowrap;
+        }
+
         .email-item {
             margin: 0 12px 10px;
             padding: 14px;
@@ -695,6 +752,70 @@
 
         .fullscreen-btn:hover {
             background-color: #f0f0f0;
+        }
+
+        .raw-email-btn {
+            background: none;
+            border: 1px solid #e5e5e5;
+            color: #666;
+            cursor: pointer;
+            font-size: 13px;
+            padding: 6px 12px;
+            border-radius: 6px;
+            transition: all 0.15s;
+        }
+
+        .raw-email-btn:hover {
+            background-color: #f0f0f0;
+        }
+
+        .raw-email-header {
+            gap: 16px;
+        }
+
+        .raw-email-warning {
+            margin-top: 4px;
+            color: #fbbf24;
+            font-size: 12px;
+            font-weight: 400;
+        }
+
+        .raw-email-actions {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            flex-shrink: 0;
+        }
+
+        .raw-email-action-btn {
+            border: 1px solid rgba(255, 255, 255, 0.24);
+            background: rgba(255, 255, 255, 0.08);
+            color: #ffffff;
+            border-radius: 6px;
+            padding: 7px 12px;
+            font-size: 13px;
+            cursor: pointer;
+            transition: background-color 0.15s, border-color 0.15s;
+        }
+
+        .raw-email-action-btn:hover {
+            background: rgba(255, 255, 255, 0.16);
+            border-color: rgba(255, 255, 255, 0.4);
+        }
+
+        .raw-email-content {
+            flex: 1;
+            margin: 0;
+            padding: 24px;
+            overflow: auto;
+            background: #0f172a;
+            color: #e5e7eb;
+            font-family: SFMono-Regular, Consolas, 'Liberation Mono', Menlo, monospace;
+            font-size: 12px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+            word-break: break-word;
+            -webkit-overflow-scrolling: touch;
         }
 
         /* 空状态 */

@@ -115,6 +115,10 @@
                     </span>
                 </div>
                 <div class="account-panel-header-actions">
+                    <button class="panel-action-btn account-selection-mode-btn" id="accountSelectionModeBtn"
+                        onclick="toggleAccountSelectionMode()" title="批量选择" aria-pressed="false">
+                        ☑
+                    </button>
                     <button class="panel-action-btn" onclick="showTagManagementModal()" title="管理标签">
                         🏷️
                     </button>
@@ -133,6 +137,13 @@
                 <div class="search-container">
                     <input type="text" id="globalSearch" class="search-input" placeholder="搜索邮箱地址、别名、备注或标签..."
                         autocomplete="off">
+                    <div class="search-scope-wrap" id="accountSearchScopeWrap">
+                        <select id="accountSearchScopeSelect" class="search-scope-select" aria-label="筛选范围"
+                            onchange="handleAccountSearchScopeChange(this.value)">
+                            <option value="all" selected>所有分组</option>
+                            <option value="group">当前分组</option>
+                        </select>
+                    </div>
                 </div>
                 <!-- 临时邮箱渠道筛选 -->
                 <div id="tempEmailProviderFilter" class="toolbar-row" style="display: none;">
@@ -308,6 +319,10 @@
                     <button class="fullscreen-btn email-detail-action-btn email-detail-action-btn--fullscreen" type="button"
                         title="全屏查看" aria-label="全屏查看" onclick="openFullscreenEmail()">
                         <span class="email-detail-action-btn__text">🔍 全屏查看</span>
+                    </button>
+                    <button class="raw-email-btn email-detail-action-btn email-detail-action-btn--raw" type="button"
+                        title="显示邮件源" aria-label="显示邮件源" onclick="openRawEmailModal()">
+                        <span class="email-detail-action-btn__text">📄 显示邮件源</span>
                     </button>
                     <label class="email-trust-toggle" title="信任此邮件" aria-label="信任此邮件">
                         <input type="checkbox" id="trustEmailCheckbox" onchange="toggleTrustMode(this)">

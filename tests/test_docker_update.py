@@ -2,7 +2,6 @@ import importlib
 import json
 import os
 import pathlib
-import shutil
 import unittest
 from unittest.mock import patch
 
@@ -18,7 +17,9 @@ web_outlook_app = importlib.import_module('web_outlook_app')
 
 
 def tearDownModule():
-    shutil.rmtree(temp_dir, ignore_errors=True)
+    state_file = temp_dir / 'docker_update_state.json'
+    if state_file.exists():
+        state_file.unlink()
 
 
 class DockerUpdateTests(unittest.TestCase):

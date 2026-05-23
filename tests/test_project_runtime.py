@@ -211,6 +211,38 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertEqual(status_by_id[second_account_id], 'success')
         self.assertEqual(status_by_id[inactive_account_id], 'never')
 
+    def test_raw_email_endpoint_returns_graph_mime_source_as_text(self):
+        account_id = self._insert_account('raw-graph@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            db.execute(
+                "UPDATE accounts SET client_id = ?, refresh_token = ? WHERE id = ?",
+                ('client-id', 'refresh-token', account_id),
+            )
+            db.commit()
+
+        with patch.object(web_outlook_app, 'get_raw_email_graph', return_value=b'From: sender@example.com\r\nSubject: Raw Source\r\n\r\nHello'):
+            response = self.client.get('/api/email/raw-graph@example.com/message-1/raw?method=graph&folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['filename'], 'message-1.eml')
+        self.assertIn('Subject: Raw Source', payload['raw'])
+        self.assertIn('原始邮件包含完整邮件头', payload['warning'])
+
+    def test_raw_email_endpoint_returns_imap_mime_source_as_text(self):
+        self._insert_account('raw-imap@example.com')
+
+        with patch.object(web_outlook_app, 'get_raw_email_imap', return_value='From: sender@example.com\r\nSubject: IMAP Raw\r\n\r\nHello'):
+            response = self.client.get('/api/email/raw-imap@example.com/42/raw?method=imap&folder=inbox')
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['filename'], '42.eml')
+        self.assertIn('Subject: IMAP Raw', payload['raw'])
+
     def test_csrf_token_endpoint_requires_login(self):
         anonymous_client = self.app.test_client()
         response = anonymous_client.get('/api/csrf-token')
@@ -566,29 +598,29 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertTrue(search_payload['success'])
         self.assertEqual(search_payload['accounts'][0]['sort_order'], 7)
 
-    def test_account_search_is_scoped_to_requested_group(self):
-        source_group_id = self._create_group('source-search-group')
-        target_group_id = self._create_group('target-search-group')
-        moved_account_id = self._insert_account('moved-search@example.com', group_id=target_group_id)
-        self._insert_account('source-only@example.com', group_id=source_group_id)
+    def test_account_search_can_filter_to_group(self):
+        target_group_id = self._create_group('搜索分组')
+        self._insert_account('scope-filter-default@example.com', group_id=1)
+        self._insert_account('scope-filter-target@example.com', group_id=target_group_id)
+        self._insert_account('scope-filter-other@example.com', group_id=1)
 
-        source_response = self.client.get(
-            f'/api/accounts/search?group_id={source_group_id}&q=moved-search'
+        group_response = self.client.get(
+            f'/api/accounts/search?q=scope-filter&group_id={target_group_id}&sort_by=email&sort_order=asc'
         )
-        self.assertEqual(source_response.status_code, 200)
-        source_payload = source_response.get_json()
-        self.assertTrue(source_payload['success'])
-        self.assertEqual(source_payload['total'], 0)
-        self.assertEqual(source_payload['accounts'], [])
+        self.assertEqual(group_response.status_code, 200)
+        group_payload = group_response.get_json()
+        self.assertTrue(group_payload['success'])
+        self.assertEqual(group_payload['total'], 1)
+        self.assertEqual(
+            [account['email'] for account in group_payload['accounts']],
+            ['scope-filter-target@example.com']
+        )
 
-        target_response = self.client.get(
-            f'/api/accounts/search?group_id={target_group_id}&q=moved-search'
-        )
-        self.assertEqual(target_response.status_code, 200)
-        target_payload = target_response.get_json()
-        self.assertTrue(target_payload['success'])
-        self.assertEqual(target_payload['total'], 1)
-        self.assertEqual(target_payload['accounts'][0]['id'], moved_account_id)
+        all_response = self.client.get('/api/accounts/search?q=scope-filter&sort_by=email&sort_order=asc')
+        self.assertEqual(all_response.status_code, 200)
+        all_payload = all_response.get_json()
+        self.assertTrue(all_payload['success'])
+        self.assertEqual(all_payload['total'], 3)
 
     def test_add_account_without_sort_order_uses_created_at_fallback(self):
         response = self.client.post(
@@ -611,6 +643,78 @@ class ProjectRuntimeTests(unittest.TestCase):
 
         self.assertIsNotNone(row)
         self.assertIsNone(row['sort_order'])
+
+    def test_accounts_api_import_applies_shared_metadata_to_new_accounts(self):
+        existing_id = self._insert_account('metadata-existing@example.com')
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            tag_id = db.execute(
+                'INSERT INTO tags (name, color) VALUES (?, ?)',
+                ('导入批次', '#0078d4')
+            ).lastrowid
+            db.commit()
+
+        with patch.object(web_outlook_app, 'encrypt_data', side_effect=lambda value: value):
+            response = self.client.post('/api/accounts', json={
+                'account_string': '\n'.join([
+                    'metadata-existing@example.com----old-password',
+                    'metadata-new-a@example.com----imap-password-a',
+                    'metadata-new-b@example.com----imap-password-b',
+                ]),
+                'group_id': 1,
+                'provider': 'gmail',
+                'remark': '统一导入备注',
+                'status': 'inactive',
+                'tag_ids': [tag_id],
+            })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['added_count'], 2)
+        self.assertEqual(payload['skipped_count'], 1)
+        self.assertEqual(payload['tagged_count'], 2)
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            rows = db.execute(
+                '''
+                SELECT id, email, remark, status
+                FROM accounts
+                WHERE email IN (?, ?, ?)
+                ORDER BY email
+                ''',
+                (
+                    'metadata-existing@example.com',
+                    'metadata-new-a@example.com',
+                    'metadata-new-b@example.com',
+                )
+            ).fetchall()
+            account_rows = {row['email']: dict(row) for row in rows}
+            tagged_rows = db.execute(
+                '''
+                SELECT account_id
+                FROM account_tags
+                WHERE tag_id = ?
+                ORDER BY account_id
+                ''',
+                (tag_id,)
+            ).fetchall()
+
+        self.assertEqual(account_rows['metadata-existing@example.com']['id'], existing_id)
+        self.assertEqual(account_rows['metadata-existing@example.com']['remark'], '')
+        self.assertEqual(account_rows['metadata-existing@example.com']['status'], 'active')
+        self.assertEqual(account_rows['metadata-new-a@example.com']['remark'], '统一导入备注')
+        self.assertEqual(account_rows['metadata-new-a@example.com']['status'], 'inactive')
+        self.assertEqual(account_rows['metadata-new-b@example.com']['remark'], '统一导入备注')
+        self.assertEqual(account_rows['metadata-new-b@example.com']['status'], 'inactive')
+        self.assertEqual(
+            {row['account_id'] for row in tagged_rows},
+            {
+                account_rows['metadata-new-a@example.com']['id'],
+                account_rows['metadata-new-b@example.com']['id'],
+            }
+        )
 
     def test_update_account_without_sort_order_clears_custom_sort(self):
         account_id = self._insert_account('clear-sort@example.com')
@@ -867,6 +971,52 @@ class ProjectRuntimeTests(unittest.TestCase):
         self.assertEqual(put_mock.call_args.kwargs['auth'], ('dav-user', 'dav-pass'))
         self.assertEqual(delete_mock.call_args.kwargs['auth'], ('dav-user', 'dav-pass'))
 
+    def test_webdav_backup_test_404_explains_missing_directory(self):
+        class PutResponseStub:
+            status_code = 404
+
+        with patch.object(web_outlook_app.requests, 'put', return_value=PutResponseStub()):
+            response = self.client.post(
+                '/api/settings/test-webdav-backup',
+                json={
+                    'config': {
+                        'url': 'https://dav.jianguoyun.com/dav',
+                        'username': 'dav-user',
+                        'password': 'dav-pass',
+                    }
+                }
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertEqual(payload['status_code'], 404)
+        self.assertIn('目标目录不存在', payload['error'])
+        self.assertIn('https://dav.jianguoyun.com/dav/mailBackup', payload['error'])
+
+    def test_webdav_backup_test_409_explains_path_conflict(self):
+        class PutResponseStub:
+            status_code = 409
+
+        with patch.object(web_outlook_app.requests, 'put', return_value=PutResponseStub()):
+            response = self.client.post(
+                '/api/settings/test-webdav-backup',
+                json={
+                    'config': {
+                        'url': 'https://dav.jianguoyun.com/dav/mailBackup',
+                        'username': 'dav-user',
+                        'password': 'dav-pass',
+                    }
+                }
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertEqual(payload['status_code'], 409)
+        self.assertIn('目标路径冲突', payload['error'])
+        self.assertIn('先创建 mailBackup 文件夹', payload['error'])
+
     def test_manual_webdav_upload_requires_login_password(self):
         self._insert_account('manual-upload@example.com', group_id=1)
         with self.app.app_context():
@@ -1038,6 +1188,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
     def test_webdav_backup_settings_ui_is_present(self):
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
         settings_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '07-settings.js').read_text(encoding='utf-8')
+        settings_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '06-modals-toast.css').read_text(encoding='utf-8')
 
         self.assertIn('id="settingsWebdavBackupSection"', settings_html)
         self.assertIn('id="webdavBackupEnabled"', settings_html)
@@ -1046,6 +1197,10 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('id="testWebdavBackupBtn"', settings_html)
         self.assertIn('id="uploadWebdavBackupBtn"', settings_html)
         self.assertIn('id="webdavBackupTestResult"', settings_html)
+        self.assertIn('请先在 WebDAV 服务中创建目录', settings_html)
+        self.assertIn('https://dav.jianguoyun.com/dav/mailBackup', settings_html)
+        self.assertLess(settings_html.index('id="webdavBackupPassword"'), settings_html.index('id="testWebdavBackupBtn"'))
+        self.assertLess(settings_html.index('id="testWebdavBackupBtn"'), settings_html.index('id="webdavBackupCron"'))
         self.assertIn('selectWebdavBackupCronExample', settings_html)
         self.assertIn('async function validateWebdavBackupCronExpression()', settings_js)
         self.assertIn('async function testWebdavBackup()', settings_js)
@@ -1054,6 +1209,9 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("fetch('/api/settings/upload-webdav-backup'", settings_js)
         self.assertIn('expected_fields: 5', settings_js)
         self.assertIn('settings.webdav_backup_verify_password = webdavBackupVerifyPassword;', settings_js)
+        self.assertIn('.settings-sidebar-list', settings_css)
+        self.assertIn('overflow-y: auto;', settings_css)
+        self.assertIn('scrollbar-width: thin;', settings_css)
 
     def test_temp_email_list_uses_selected_tag_filters(self):
         temp_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '03-temp-emails.js').read_text(encoding='utf-8')
@@ -1122,17 +1280,6 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("setShowGroupId(String(data?.settings?.show_group_id) !== 'false');", core_js)
         self.assertIn('if (!shouldShowGroupId()) {', core_js)
 
-    def test_account_search_request_includes_current_group_scope(self):
-        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
-        search_request_block = groups_js.split("async function searchAccounts(query, forceRefresh = false, append = false)", 1)[1]
-
-        self.assertIn("if (currentGroupId && !isTempEmailGroup) {", search_request_block)
-        self.assertIn("params.set('group_id', String(currentGroupId));", search_request_block)
-        self.assertLess(
-            search_request_block.index("params.set('group_id', String(currentGroupId));"),
-            search_request_block.index("fetch(`/api/accounts/search?${params.toString()}`)")
-        )
-
     def test_main_four_panel_layout_uses_draggable_splitters(self):
         layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
         layout_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '03-layout.css').read_text(encoding='utf-8')
@@ -1140,6 +1287,7 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         email_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '05-email-content.css').read_text(encoding='utf-8')
         responsive_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '08-responsive.css').read_text(encoding='utf-8')
         core_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '01-core.js').read_text(encoding='utf-8')
+        emails_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '05-emails.js').read_text(encoding='utf-8')
 
         self.assertEqual(layout_html.count('data-layout-resizer'), 3)
         self.assertIn('id="groupAccountResizer"', layout_html)
@@ -1169,6 +1317,8 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn("panel.insertAdjacentElement('afterend', createLayoutResizerElement(id, panelId, label));", core_js)
         self.assertIn("window.localStorage.setItem(LAYOUT_RESIZER_STORAGE_KEY", core_js)
         self.assertIn('initLayoutResizers();', core_js)
+        self.assertIn('restoreLayoutPanelWidths();', emails_js)
+        self.assertIn('stopLayoutResize();', emails_js)
 
     def test_settings_ui_reorganizes_general_and_gptmail_sections(self):
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')

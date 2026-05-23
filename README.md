@@ -2,7 +2,6 @@
 
 一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
 ## 📦 快速开始
-
 ### 体验站点（可能非最新版本）
 https://aso.de5.net
 admin123
@@ -110,7 +109,7 @@ services:
 docker-compose up -d
 ```
 
-#### 可选：启用界面 Docker 在线更新
+#### 可选：启用界面 Docker 在线更新 + 使用自己的 Client ID 和回调 URL
 
 界面里的 Docker 在线更新需要访问宿主机 Docker socket。`/var/run/docker.sock` 具有宿主机 Docker 管理权限，只建议在可信环境开启。
 
@@ -118,6 +117,8 @@ docker-compose up -d
 应用默认会在 daemon 明确返回“最低支持 API 版本”时自动按该版本重试；如果你的 Docker 环境或 socket 代理有特殊兼容要求，也可以显式设置 `DOCKER_UPDATE_API_VERSION`，其值可参考 `docker version --format '{{.Server.APIVersion}}'` 的输出。
 可选环境变量 `DOCKER_UPDATE_STATUS_TIMEOUT` 用于单独控制状态查询和容器 inspect 的超时时间（秒），不影响实际更新任务的 `DOCKER_UPDATE_TIMEOUT`。
 如果当前 `latest` / `main` / `dev` 标签没有新的镜像可拉取，界面会显示本次没有应用更新，而不是误报为更新失败。
+
+如果想让界面里的「获取 Token」使用自己的 Azure 应用，请同时设置 `OAUTH_CLIENT_ID` 和 `OAUTH_REDIRECT_URI`。这两个值会用于生成 Microsoft 授权链接和换取 Refresh Token；换取成功后界面返回的 Client ID 需要和 Refresh Token 一起导入账号。未设置时会使用项目内置的默认 Client ID 和默认回调地址 `http://localhost:8080`。
 
 ```yaml
 version: '3.8'
@@ -138,6 +139,9 @@ services:
       - DOCKER_UPDATE_CONTAINER=outlook-mail-reader
       # 可选：在较新的 Docker daemon / socket 代理环境中显式指定 API 版本
       # - DOCKER_UPDATE_API_VERSION=1.52
+      # 可选：让界面 OAuth 助手使用你自己的 Azure 应用
+      # - OAUTH_CLIENT_ID=your-azure-application-client-id
+      # - OAUTH_REDIRECT_URI=http://localhost:8080
     restart: unless-stopped
 ```
 
@@ -168,7 +172,7 @@ services:
 - 🎨 **现代化 UI** - 四栏布局，账号列表、邮件列表、邮件详情分区清晰
 - ⚡ **性能优化** - 邮件列表与账号列表缓存，分组切换和账号切换更快
 - 📄 **分页加载** - 滚动到底部自动加载下一页（每页20封）
-- 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取和查看详情
+- 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取、查看详情，并支持 Cloudflare 全部邮件视图
 - ⚙️ **系统设置** - 在线修改密码、API Key 等
 - 🔄 **OAuth2 助手** - 内置授权流程，快速获取 Refresh Token
 - 💾 **邮件缓存** - 智能缓存邮件列表，切换即时展示
@@ -216,7 +220,6 @@ Web 应用采用四栏式布局设计：
 ![邮箱列表](img/邮箱列表.png)
 
 ### 全局搜索功能
-
 ![全局搜索](img/全局搜索.png)
 
 ### 导入邮箱账号
@@ -236,6 +239,8 @@ Web 应用采用四栏式布局设计：
 
 1. **Client ID** - Microsoft Azure 应用注册的客户端 ID
 2. **Refresh Token** - OAuth2 刷新令牌
+
+界面中的 OAuth2 助手会读取服务启动时的 `OAUTH_CLIENT_ID` 和 `OAUTH_REDIRECT_URI`。如果你在 Docker / Docker Compose 里配置了自己的值，授权链接和换取 Token 都会使用这些值；如果没有配置，则使用项目内置默认值。账号导入时，Client ID 要和同一次授权换出的 Refresh Token 配套使用。
 
 #### 步骤 1：注册 Azure 应用（这一步看目前的情况得E3 或者 E5 或者其他的开发者账号才能创建）
 
@@ -332,7 +337,7 @@ user@example.com----app-password
 user@example.com----app-password----imap.example.com----993
 ```
 
-支持批量导入，每行一个账号。导入时可选择是否立即开启邮件转发。普通邮箱导入时不能选择临时邮箱分组。
+支持批量导入，每行一个账号。导入文件格式保持不变；导入弹窗可为本次新增账号统一设置备注、标签、状态，并可选择是否立即开启邮件转发。普通邮箱导入时不能选择临时邮箱分组。
 
 ### 3. 查看邮件
 
@@ -344,7 +349,50 @@ user@example.com----app-password----imap.example.com----993
 6. 点击邮件查看详情，支持 HTML 渲染与全屏查看
 7. 需要查看 `deleteditems` 或 `all` 聚合结果时，建议使用对外 API 或内部 API
 
-### 4. 别名管理
+### 4. 批量选择与批量操作
+
+#### 邮箱账号列表
+
+邮箱账号列表左侧有选择框，适合对多个账号同时刷新 Token、复制邮箱、修改转发状态、打标签、移动分组或删除。
+
+常用选择方式：
+
+1. **单选/取消单选**：点击账号左侧的选择框。
+2. **进入批量选择模式**：点击邮箱面板顶部的「☑」按钮。按钮高亮后，可点击账号行来切换选中状态，不必点中选择框。
+3. **连续范围选择**：先选中一个账号，再按住 `Shift` 点击另一个账号或选择框，会选中两者之间的连续范围。
+4. **拖拽选择**：进入批量选择模式后，在账号行或选择框上按住鼠标/触控板并向上或向下拖动，可连续选中经过的账号；如果起点账号已选中，本次拖拽会批量取消选中经过的账号。
+5. **全选当前列表**：点击批量菜单里的「全选」或「全选已加载」。账号列表分页加载时，该按钮只作用于当前已经加载到页面中的账号；继续向下滚动加载更多后，可再次点击全选已加载。
+6. **清空选择**：点击「清空选择」取消当前列表中的所有选择。
+
+选中至少一个账号后，会出现批量菜单：
+
+- PC 端：菜单悬浮在第一个选中账号的右侧，并随账号列表滚动重新定位。
+- 移动端：菜单显示在底部，便于触控操作。
+
+普通邮箱账号支持的批量操作：
+
+- **刷新 Token**：只对 Outlook/Hotmail OAuth 账号可用；IMAP 账号不可刷新，按钮会按可刷新数量提示。
+- **复制邮箱+别名**：复制选中账号的主邮箱和已配置别名。
+- **开启转发 / 取消转发**：批量修改账号级转发开关。全局转发渠道仍需在「设置 -> 邮件转发设置」中配置。
+- **标签+ / 标签-**：给选中账号批量添加或移除一个标签。
+- **移动**：把选中账号移动到指定分组。
+- **删除**：永久删除选中账号，操作前会再次确认。
+
+临时邮箱分组也使用同一套选择方式，但批量菜单只显示适用于临时邮箱的操作，例如复制邮箱、标签添加/移除和删除；刷新 Token、转发开关、移动分组等普通账号专属操作会隐藏。
+
+#### 邮件列表
+
+普通邮箱的邮件列表左侧也有选择框，适合批量处理当前邮箱的邮件：
+
+1. 点击邮件左侧选择框选中或取消选中单封邮件。
+2. 点击「全选」选中当前已加载的邮件列表。
+3. 点击「清空选择」取消已选邮件。
+4. 点击「设为已读」把选中的未读邮件批量标记为已读；如果所选邮件都已读，该按钮会禁用。
+5. 点击「删除」批量永久删除选中邮件，操作前会再次确认。
+
+邮件批量选择只作用于当前邮箱当前文件夹/聚合视图里已经加载的邮件；切换邮箱、刷新邮件列表或列表为空时，已选邮件会被清空。
+
+### 5. 别名管理
 
 1. 打开某个邮箱账号的「编辑账号」
 2. 在「别名邮箱」中按行填写多个别名
@@ -356,7 +404,7 @@ user@example.com----app-password----imap.example.com----993
 - 某些站点使用了 `user+tag@example.com`
 - 外部邮箱自动转发到本项目管理邮箱后，希望继续用原邮箱名来取信
 
-### 5. 邮件转发
+### 6. 邮件转发
 
 邮件转发分成两层控制：
 
@@ -376,7 +424,7 @@ user@example.com----app-password----imap.example.com----993
 - 可以手动触发一次转发检查
 - 可以查看最近转发历史和失败记录
 
-### 6. WebDAV 备份
+### 7. WebDAV 备份
 
 在「设置 -> WebDAV 备份」中配置：
 
@@ -390,10 +438,11 @@ user@example.com----app-password----imap.example.com----993
 补充说明：
 
 - 定时备份会上传与“导出全部分组”一致的文本文件，文件名形如 `all_groups_backup_YYYYMMDD_HHMMSS.txt`
+- 坚果云需要先创建专用目录，再填写该目录 URL，例如 `https://dav.jianguoyun.com/dav/mailBackup`；不要只填写 `https://dav.jianguoyun.com/dav`
 - 「手动上传」会立即上传真实备份文件，需要输入登录密码
 - WebDAV 备份涉及账号、令牌、临时邮箱凭据等敏感数据，建议使用专用 WebDAV 目录并控制访问权限
 
-### 7. 对外 API
+### 8. 对外 API
 
 通过 API Key 直接获取邮件，无需登录 Web 界面。
 
@@ -403,6 +452,7 @@ user@example.com----app-password----imap.example.com----993
 - `folder=all` 一次聚合收件箱和垃圾邮件并按标准化后的邮件时间倒序排序，`top` 按每个文件夹分别计算
 - 支持按主题、发件人、关键词筛选列表
 - 支持特殊字符别名，例如 `user+alias@example.com`
+- 查询 `@gmail.com` / `@googlemail.com` 地址时，原后缀未命中会自动回退到另一个后缀
 - 默认 `top=1`
 
 **配置步骤：**

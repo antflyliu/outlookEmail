@@ -593,6 +593,14 @@ def persist_rotated_refresh_token(account_id: int, refresh_token: str, db_conn=N
         return False
 
 
+def extract_token_response_error(response, fallback: str = '未知错误') -> str:
+    try:
+        error_data = response.json()
+    except Exception:
+        return str(getattr(response, 'text', '') or getattr(response, 'reason', '') or fallback)
+    return str(error_data.get('error_description', error_data.get('error', fallback)) or fallback)
+
+
 def log_forwarding_result(account_id: int, account_email: str, message_id: str, channel: str,
                           status: str, error_message: str = None, db_conn=None):
     """记录转发结果到数据库"""
@@ -627,37 +635,46 @@ def test_refresh_token(client_id: str, refresh_token: str, proxy_url: str = None
                        fallback_proxy_urls: List[str] = None) -> tuple[bool, Optional[str], str]:
     """测试 refresh token 是否有效，返回 (是否成功, 错误信息, 新 refresh_token)"""
     try:
-        # 尝试使用 Graph API 获取 access token
-        # 使用与 get_access_token_graph 相同的 scope，确保一致性
-        res = post_with_proxy_fallback(
-            TOKEN_URL_GRAPH,
-            data={
-                "client_id": client_id,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "scope": "https://graph.microsoft.com/.default"
-            },
-            timeout=HTTP_REQUEST_TIMEOUT,
+        graph_res = request_graph_token_response(
+            client_id,
+            refresh_token,
+            proxy_url=proxy_url,
+            fallback_proxy_urls=fallback_proxy_urls,
+            include_original_scope_fallback=True,
+        )
+    except Exception as e:
+        return False, f"Graph 刷新请求异常: {str(e)}", ''
+
+    if graph_res.status_code == 200:
+        payload = {}
+        try:
+            payload = graph_res.json()
+        except Exception:
+            payload = {}
+        return True, None, str(payload.get('refresh_token') or '').strip()
+
+    graph_error_msg = extract_token_response_error(graph_res)
+
+    try:
+        imap_res = request_imap_token_response(
+            client_id,
+            refresh_token,
             proxy_url=proxy_url,
             fallback_proxy_urls=fallback_proxy_urls,
         )
-
-        if res.status_code == 200:
-            payload = {}
-            try:
-                payload = res.json()
-            except Exception:
-                payload = {}
-            return True, None, str(payload.get('refresh_token') or '').strip()
-        else:
-            try:
-                error_data = res.json()
-            except Exception:
-                error_data = {}
-            error_msg = error_data.get('error_description', error_data.get('error', '未知错误'))
-            return False, error_msg, ''
     except Exception as e:
-        return False, f"请求异常: {str(e)}", ''
+        return False, f"Graph 刷新失败: {graph_error_msg}; IMAP 刷新请求异常: {str(e)}", ''
+
+    if imap_res.status_code == 200:
+        payload = {}
+        try:
+            payload = imap_res.json()
+        except Exception:
+            payload = {}
+        return True, None, str(payload.get('refresh_token') or '').strip()
+
+    imap_error_msg = extract_token_response_error(imap_res)
+    return False, f"Graph 刷新失败: {graph_error_msg}; IMAP 刷新失败: {imap_error_msg}", ''
 
 
 def refresh_outlook_account_token(account: sqlite3.Row, refresh_type: str = 'manual',
@@ -2520,6 +2537,78 @@ def api_delete_emails():
     # 所有方式均失败，返回 Graph API 的错误
     return jsonify(graph_res)
 
+
+
+@app.route('/api/email/<email_addr>/<path:message_id>/raw')
+@login_required
+def api_get_raw_email(email_addr, message_id):
+    """获取原始 MIME 邮件源码。"""
+    account = get_account_by_email(email_addr)
+
+    if not account:
+        return jsonify({'success': False, 'error': '账号不存在'})
+
+    method = request.args.get('method', 'graph')
+    folder = normalize_folder_name(request.args.get('folder', 'inbox'))
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+
+    raw_content = None
+    if account.get('account_type') == 'imap':
+        raw_content = get_raw_email_imap_generic(
+            account['email'],
+            account.get('imap_password', ''),
+            account.get('imap_host', ''),
+            account.get('imap_port', 993),
+            message_id,
+            folder,
+            account.get('provider', 'custom'),
+            proxy_url
+        )
+    elif method == 'graph':
+        raw_content = get_raw_email_graph(
+            account['client_id'],
+            account['refresh_token'],
+            message_id,
+            proxy_url,
+            fallback_proxy_urls,
+        )
+        if raw_content is None:
+            raw_content = get_raw_email_imap(
+                account['email'],
+                account['client_id'],
+                account['refresh_token'],
+                message_id,
+                folder,
+                proxy_url,
+                fallback_proxy_urls,
+            )
+    else:
+        raw_content = get_raw_email_imap(
+            account['email'],
+            account['client_id'],
+            account['refresh_token'],
+            message_id,
+            folder,
+            proxy_url,
+            fallback_proxy_urls,
+        )
+
+    if raw_content is None:
+        return jsonify({'success': False, 'error': '获取原始邮件失败'})
+
+    if isinstance(raw_content, str):
+        raw_text = raw_content
+    else:
+        raw_text = bytes(raw_content).decode('utf-8', errors='replace')
+
+    safe_message_id = re.sub(r'[^A-Za-z0-9_.-]+', '_', str(message_id)).strip('_') or 'message'
+    return jsonify({
+        'success': True,
+        'raw': raw_text,
+        'filename': f'{safe_message_id}.eml',
+        'warning': '原始邮件包含完整邮件头和路由信息，请谨慎分享。'
+    })
 
 
 @app.route('/api/email/<email_addr>/<path:message_id>')

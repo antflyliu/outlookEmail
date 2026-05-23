@@ -844,6 +844,24 @@ def build_webdav_upload_url(base_url: str, filename: str) -> str:
     return f"{base_url.rstrip('/')}/{quote(filename)}"
 
 
+def build_webdav_upload_error_message(action: str, status_code: int) -> str:
+    message = f'WebDAV {action}失败：HTTP {status_code}'
+    if status_code == 404:
+        message += (
+            '。目标目录不存在或不允许写入该路径；请先创建专用备份目录，并填写该目录的 WebDAV URL。'
+            '如果使用坚果云，不要只填写 https://dav.jianguoyun.com/dav，'
+            '建议填写类似 https://dav.jianguoyun.com/dav/mailBackup 的已存在目录'
+        )
+    elif status_code == 409:
+        message += (
+            '。目标路径冲突，通常是上级目录不存在或目录路径写错；请先在 WebDAV 服务中创建专用备份目录，'
+            '再填写该目录的 WebDAV URL。'
+            '如果使用坚果云，请先创建 mailBackup 文件夹，'
+            '然后填写 https://dav.jianguoyun.com/dav/mailBackup，注意大小写一致'
+        )
+    return message
+
+
 def normalize_webdav_backup_config(config: Dict[str, Any]) -> Dict[str, str]:
     return {
         'url': str(config.get('url') or '').strip(),
@@ -881,9 +899,10 @@ def api_test_webdav_backup():
             timeout=HTTP_REQUEST_TIMEOUT,
         )
         if response.status_code not in (200, 201, 204):
+            error_message = build_webdav_upload_error_message('测试上传', response.status_code)
             return jsonify({
                 'success': False,
-                'error': f'WebDAV 测试上传失败：HTTP {response.status_code}',
+                'error': error_message,
                 'status_code': response.status_code,
             })
 
@@ -940,7 +959,7 @@ def upload_webdav_backup_with_config(base_url: str, username: str, password: str
         )
 
         if response.status_code not in (200, 201, 204):
-            message = f'WebDAV 上传失败：HTTP {response.status_code}'
+            message = build_webdav_upload_error_message('上传', response.status_code)
             record_webdav_backup_result('failed', message, filename)
             return {'success': False, 'error': message, 'status_code': response.status_code}
 
@@ -1374,6 +1393,10 @@ def api_get_emails_v2(email_addr):
             ]
         result['requested_email'] = requested_email
         result['resolved_email'] = account.get('email', '')
+        if account.get('resolved_query_email'):
+            result['resolved_query_email'] = account.get('resolved_query_email')
+            result['fallback_used'] = bool(account.get('fallback_used'))
+            result['fallback_email'] = account.get('fallback_email', '')
         if account.get('matched_alias'):
             result['matched_alias'] = account.get('matched_alias')
     return jsonify(result)
@@ -1410,6 +1433,10 @@ def api_external_get_emails_v2():
             ]
         result['requested_email'] = email_addr
         result['resolved_email'] = account.get('email', '')
+        if account.get('resolved_query_email'):
+            result['resolved_query_email'] = account.get('resolved_query_email')
+            result['fallback_used'] = bool(account.get('fallback_used'))
+            result['fallback_email'] = account.get('fallback_email', '')
         if account.get('matched_alias'):
             result['matched_alias'] = account.get('matched_alias')
     return jsonify(result)

@@ -33,7 +33,6 @@
 | 方法 | 路径 | 鉴权 | 返回类型 | 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
-| POST | `/api/external/accounts/batch-update-group` | API Key | JSON | 批量改普通邮箱账号分组 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 
 ### 分组、账号、标签、项目
@@ -135,7 +134,8 @@
 对外 API 使用 API Key 认证，支持两种方式：
 
 - Header: `X-API-Key: your-api-key`
-- Query: `?api_key=your-api-key` 或 `?api_token=your-api-key`
+- Query: `?api_key=your-api-key`
+- Query alias: `?api_token=your-api-key`
 
 可在 Web 界面 `设置 -> 对外 API Key` 中配置。
 
@@ -341,25 +341,27 @@ curl -H "X-API-Key: your-api-key" \
 
 ### POST `/api/external/accounts/batch-update-group`
 
-通过 API Key 把普通邮箱账号移动到目标分组。适合外部自动化在账号完成业务流程后，把账号从待处理分组移入成功分组。
+通过对外 API 批量移动账号分组，适合外部系统按账号 ID 或邮箱/别名把账号归档到目标分组。
 
 #### 请求体
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `group_id` | int | 是 | 目标分组 ID |
-| `account_ids` | int[] | 否 | 要移动的账号 ID 列表；与 `email` 至少提供一个 |
-| `account_id` | int | 否 | 单个账号 ID，兼容不想传数组的调用方 |
-| `email` | string | 否 | 按邮箱地址查找账号；与 `account_ids` 至少提供一个 |
-| `from_group_id` | int | 否 | 源分组 ID；提供后只移动仍在该源分组的账号 |
+| `group_id` / `to_group_id` | int | 是 | 目标分组 ID，不能是系统分组 |
+| `account_ids` | int[] | 否 | 要移动的账号 ID 列表 |
+| `account_id` | int | 否 | 单个账号 ID，会合并进 `account_ids` |
+| `email` | string | 否 | 当未传账号 ID 时，用主邮箱或别名匹配账号 |
+| `from_group_id` / `source_group_id` | int | 否 | 限定账号当前所在源分组 |
+
+`account_ids`、`account_id`、`email` 至少提供一种有效匹配方式。
 
 #### 请求示例
 
 ```bash
 curl -X POST \
-  -H "Content-Type: application/json" \
   -H "X-API-Key: your-api-key" \
-  -d '{"email":"user@outlook.com","from_group_id":20,"group_id":33}' \
+  -H "Content-Type: application/json" \
+  -d '{"email":"alias@example.com","from_group_id":1,"group_id":2}' \
   "http://localhost:5000/api/external/accounts/batch-update-group"
 ```
 
@@ -368,9 +370,9 @@ curl -X POST \
 ```json
 {
   "success": true,
-  "message": "已将 1 个账号移动到「订阅成功」分组",
+  "message": "已将 1 个账号移动到「目标分组」分组",
   "account_ids": [1],
-  "group_id": 33,
+  "group_id": 2,
   "moved_count": 1
 }
 ```
@@ -383,7 +385,7 @@ curl -X POST \
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `email` | string | 是 | 主邮箱或别名邮箱；若包含 `+`，会先按完整地址匹配，未命中时再按本地部分从右到左逐级去掉 `+suffix` 回退匹配，兼容主邮箱和别名邮箱 |
+| `email` | string | 是 | 主邮箱或别名邮箱；若包含 `+`，会先按完整地址匹配，未命中时再按本地部分从右到左逐级去掉 `+suffix` 回退匹配；若域名是 `gmail.com` 或 `googlemail.com`，原后缀候选都未命中后会回退到另一个后缀 |
 | `folder` | string | 否 | `inbox`、`junkemail`、`deleteditems`、`all`。`all` 会同时抓取收件箱和垃圾邮件并按时间倒序合并 |
 | `skip` | int | 否 | 分页偏移，默认 `0`。当 `folder=all` 时，对每个文件夹分别跳过 `skip` 封 |
 | `top` | int | 否 | 返回数量，默认 `1`，最大 `50`。当 `folder=all` 时，表示每个文件夹各取 `top` 封 |
@@ -414,6 +416,8 @@ curl -H "X-API-Key: your-api-key" \
   "success": true,
   "requested_email": "alias@example.com",
   "resolved_email": "user@outlook.com",
+  "resolved_query_email": "alias@example.com",
+  "fallback_used": false,
   "matched_alias": "alias@example.com",
   "method": "Graph API",
   "has_more": true,
@@ -447,6 +451,17 @@ curl -H "X-API-Key: your-api-key" \
   - `success: true`
   - `partial: true`
   - `details` 中包含失败文件夹的错误信息
+
+#### Gmail / Googlemail 后缀回退
+
+当查询地址是 `@gmail.com` 或 `@googlemail.com` 时，账号解析会先按原地址和原后缀 plus-address 回退候选查找；都未命中后，再使用另一后缀重试。例如 `user+code@gmail.com` 的候选顺序是：
+
+1. `user+code@gmail.com`
+2. `user@gmail.com`
+3. `user+code@googlemail.com`
+4. `user@googlemail.com`
+
+如果使用回退候选命中，响应会包含 `resolved_query_email`、`fallback_used`、`fallback_email` 等字段。
 
 ## 内部 API
 
@@ -543,6 +558,7 @@ curl -H "X-API-Key: your-api-key" \
 | `offset` | int | 否 | 分页偏移量，默认 `0` |
 | `sort_by` | string | 否 | 排序字段，支持 `created_at`、`email`、`sort_order` |
 | `sort_order` | string | 否 | 排序方向，`asc` 或 `desc`，默认 `desc` |
+| `group_id` | int | 否 | 仅搜索指定分组下的账号，不传则搜索全部分组 |
 | `tag_ids` | string | 否 | 逗号分隔的标签 ID，仅搜索包含任一标签的账号 |
 | `include_untagged` | bool | 否 | 与 `tag_ids` 配合使用，是否包含未打标签账号 |
 
@@ -561,6 +577,9 @@ curl -H "X-API-Key: your-api-key" \
 | `imap_host` | string | 否 | `provider=custom` 时的 IMAP 服务器 |
 | `imap_port` | int | 否 | `provider=custom` 时的 IMAP 端口 |
 | `forward_enabled` | bool | 否 | 导入后是否默认启用转发 |
+| `remark` | string | 否 | 本次新增账号统一备注，不改变 `account_string` 每行格式 |
+| `status` | string | 否 | 本次新增账号统一状态：`active` 或 `inactive` |
+| `tag_ids` | array | 否 | 本次新增账号统一绑定的标签 ID 列表 |
 
 #### 响应重点字段
 
@@ -569,6 +588,7 @@ curl -H "X-API-Key: your-api-key" \
 | `added_count` | 本次新增账号数量 |
 | `skipped_count` | 因重复等原因跳过的账号数量 |
 | `invalid_count` | 格式无效的输入行数量 |
+| `tagged_count` | 本次成功绑定标签的新增账号数量 |
 
 #### 导入格式
 
@@ -585,7 +605,10 @@ curl -H "X-API-Key: your-api-key" \
   "group_id": 1,
   "account_format": "client_id_refresh_token",
   "provider": "outlook",
-  "forward_enabled": false
+  "forward_enabled": false,
+  "remark": "批次 A",
+  "status": "active",
+  "tag_ids": [1, 2]
 }
 ```
 
@@ -1271,7 +1294,7 @@ curl -H "X-API-Key: your-api-key" \
 
 ### GET `/api/emails/<email_addr>`
 
-内部邮件列表接口。支持主邮箱或别名邮箱；若邮箱包含 `+`，会先按完整地址匹配，未命中时再按本地部分从右到左逐级去掉 `+suffix` 回退匹配，兼容主邮箱和别名邮箱。
+内部邮件列表接口。支持主邮箱或别名邮箱；若邮箱包含 `+`，会先按完整地址匹配，未命中时再按本地部分从右到左逐级去掉 `+suffix` 回退匹配，兼容主邮箱和别名邮箱。若域名是 `gmail.com` 或 `googlemail.com`，原后缀候选都未命中后会继续回退到另一个后缀。
 
 #### 查询参数
 
@@ -1286,7 +1309,7 @@ curl -H "X-API-Key: your-api-key" \
 
 当 `folder=all` 时，行为与对外 API 一致：同时抓取 `inbox` 与 `junkemail`，按时间合并排序。
 
-成功响应会额外包含 `requested_email`、`resolved_email`；当请求邮箱命中别名时，还会包含 `matched_alias`。
+成功响应会额外包含 `requested_email`、`resolved_email`；当请求邮箱命中别名时，还会包含 `matched_alias`。如果使用 Gmail/Googlemail 或 plus-address 回退候选命中，还会包含 `resolved_query_email`、`fallback_used`、`fallback_email` 等字段。
 
 #### 列表项字段
 
@@ -1461,6 +1484,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | POST | `/api/temp-emails/batch-delete` | JSON: `temp_email_ids` | 批量删除临时邮箱 |
 | GET | `/api/duckmail/domains` | 无 | 获取 DuckMail 可用域名 |
 | GET | `/api/cloudflare/domains` | 无 | 获取 Cloudflare 可用域名 |
+| GET | `/api/cloudflare/messages` | Query: `limit?`、`offset?`、`address?` | 使用 Cloudflare 管理员接口查看当前 Worker 全部邮件，可选按收件地址过滤 |
 
 `/api/temp-emails/import` 的导入格式：
 
@@ -1503,6 +1527,50 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | POST | `/api/temp-emails/<email_addr>/refresh` | 路径参数 | 主动刷新一次临时邮箱邮件 |
 
 `GET /messages` 与 `POST /refresh` 都会返回统一结构的 `emails` 列表。`POST /refresh` 还会包含 `new_count`，表示本次新保存的邮件数量。
+
+### GET `/api/cloudflare/messages`
+
+查看当前配置的 Cloudflare Temp Email Worker 全部邮件。该接口需要 Web 登录 session，不使用对外 API Key；它不同于普通邮箱的 `folder=all`，后者只聚合某个普通邮箱账号的收件箱和垃圾邮件。
+
+#### 查询参数
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `limit` | int | 否 | 返回数量，默认 `50`，最大 `100` |
+| `offset` | int | 否 | 分页偏移，默认 `0` |
+| `address` | string | 否 | 收件地址过滤；不传时查看 Worker 全部邮件 |
+
+当 `address` 是 `@gmail.com` 或 `@googlemail.com`，且第一次地址过滤查询成功但返回 0 封邮件时，会自动用另一个后缀重试。响应中的 `requested_email`、`queried_email`、`fallback_used` 会说明实际查询地址。
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "method": "Cloudflare Admin",
+  "requested_email": "user@gmail.com",
+  "queried_email": "user@googlemail.com",
+  "fallback_used": true,
+  "limit": 50,
+  "offset": 0,
+  "count": 1,
+  "total_count": 1,
+  "has_more": false,
+  "emails": [
+    {
+      "id": "cf-admin-123",
+      "from": "sender@example.com",
+      "to": "user@googlemail.com",
+      "subject": "Verification code",
+      "body_preview": "Your code is 123456",
+      "date": 1770000000,
+      "timestamp": 1770000000,
+      "body_type": "text",
+      "folder": "cloudflare"
+    }
+  ]
+}
+```
 
 ## OAuth 辅助接口
 
