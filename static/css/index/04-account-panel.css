@@ -179,7 +179,7 @@
 
         .account-list-options-row {
             display: grid;
-            grid-template-columns: minmax(0, 1fr) 100px;
+            grid-template-columns: minmax(0, 1fr) auto 100px;
             align-items: center;
             gap: 8px;
             min-width: 0;
