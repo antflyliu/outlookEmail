@@ -1,6 +1,6 @@
 # 多邮箱邮件管理工具
 
-一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
+一个面向多邮箱账号场景的邮件管理工具，支持通过 Outlook/Hotmail OAuth、Microsoft Graph API 和标准 IMAP 统一读取、管理和转发邮件，并提供 Web 界面、Chrome/Edge 浏览器扩展，用于分组管理、账号管理、邮件查看和对外 API 调用。当前支持 Outlook/Hotmail、Gmail、QQ、163、126、Yahoo、阿里邮箱以及自定义 IMAP 邮箱，同时集成 GPTMail、DuckMail、Cloudflare Temp Email 多提供商临时邮箱能力。
 ## 📦 快速开始
 ### 体验站点（可能非最新版本）
 https://aso.de5.net
@@ -9,34 +9,9 @@ admin123
 
 ## 🌿 版本管理与发布
 
-本项目采用轻量化双分支版本管理：
+本项目采用轻量化双分支版本管理：`main` 为稳定发布分支，`dev` 为日常开发分支。
 
-- `main`：稳定分支，只保留可发布版本
-- `dev`：开发分支，日常功能开发与修复默认在这里进行
-
-标准发版流程：
-
-1. 在 `dev` 分支完成开发与验证
-2. 合并到 `main`
-3. 更新 `VERSION` 与 `CHANGELOG.md`
-4. 推送 `main`
-5. 手动触发 GitHub Actions 的 `Create GitHub Release` 工作流，并传入不带 `v` 的版本号，例如 `2.0.15`
-
-手动发版工作流会自动：
-
-- 构建 Windows `exe` 并打包为 Release 附件
-- 创建并推送对应标签，例如 `v2.0.15`
-- 根据 `CHANGELOG.md` 中对应版本条目生成 GitHub Release 正文
-- 构建并发布正式版本镜像 `ghcr.io/assast/outlookemail:v2.0.15`
-
-Docker 镜像标签约定：
-
-- `ghcr.io/assast/outlookemail:latest`：默认分支最近一次符合条件的稳定构建
-- `ghcr.io/assast/outlookemail:main`：`main` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:dev`：`dev` 分支最近一次符合条件的构建
-- `ghcr.io/assast/outlookemail:vX.Y.Z`：正式版本镜像
-
-更完整的发版步骤、工作流行为和核对清单见 [发版说明](RELEASE.md)。
+完整的发版步骤、工作流行为和核对清单见 [发版说明](RELEASE.md)。
 
 ### 方式一：下载 Windows `exe`(win可用)
 
@@ -53,7 +28,24 @@ Docker 镜像标签约定：
 - Windows 数据默认保存在 `%APPDATA%\OutlookEmail`
 - 默认登录密码仍然是 `admin123`，首次登录后建议立即修改
 
-### 方式二：使用 Docker（推荐服务器部署）
+### 方式二：下载 macOS 安装包
+
+从 GitHub Releases 下载对应架构的 `OutlookEmail-macos-*-*.dmg`，打开后把 `OutlookEmail.app` 拖到 `Applications` 即可。
+
+桌面版首次启动会自动：
+
+- 生成并持久化 `SECRET_KEY`
+- 创建本地数据目录和 SQLite 数据库
+- 启动 Web 服务，默认地址 `http://127.0.0.1:5000`
+
+说明：
+
+- macOS 数据默认保存在 `~/Library/Application Support/OutlookEmail`
+- 如果 macOS 提示Apple无法验证“OutlookEmail”是否包含可能危害Mac安全或泄漏隐私的恶意软件。可执行下面命令然后重试
+  `sudo xattr -rd com.apple.quarantine /Applications/OutlookEmail.app` 
+- 默认登录密码仍然是 `admin123`，首次登录后建议立即修改
+
+### 方式三：使用 Docker（推荐服务器部署）
 
 ```bash
 # 拉取最新镜像
@@ -69,7 +61,7 @@ docker run -d \
   ghcr.io/assast/outlookemail:latest
 ```
 
-### 方式三：使用 Python 直接运行
+### 方式四：使用 Python 直接运行
 
 ```bash
 git clone https://github.com/assast/outlookEmail.git
@@ -155,12 +147,26 @@ services:
 2. **Outlook/Hotmail OAuth + IMAP 回退** - `outlook.live.com` / `outlook.office365.com`
 3. **标准 IMAP** - 适用于 Gmail、QQ、163、126、Yahoo、阿里邮箱和自定义 IMAP
 
+#### 普通邮箱本地保留行为与限制
+
+普通邮箱本地保留开关 `normal_mail_local_retention_enabled` 默认关闭。用户需要在系统设置中明确开启后，普通 Outlook/Hotmail 与标准 IMAP 邮箱才会把列表元数据和已查看、补齐过的部分正文保存到本机 SQLite。
+
+开启后，普通邮箱列表会优先从本地保留数据加载，命中时可立即显示最近一次保留的邮件列表；在本地优先模式下继续向下滚动加载更多，也会沿用本地保留分页，因此远程不可用时仍可查看超过首屏的已保留邮件。页面同时会在后台继续向 Graph API 或 IMAP 发起远程同步。远程同步成功后会把新列表元数据写回本地保留库；同步失败时，当前页面会保留本地列表并显示后台同步失败提示，而不会把列表清空。
+
+后台同步发现本地尚未显示的新邮件时，页面会显示“有 N 封新邮件已同步”的非打断式提示。同步成功不会立即把新邮件并入当前列表；用户点击提示后，新邮件才会合并到当前列表，并执行高亮、列表缓存更新和新邮件正文保留的后台补齐，避免正在阅读或已选择的邮件被突然替换。
+
+邮件详情会优先使用已保留的正文内容；如果本地行还没有正文，远程详情读取成功后会回填正文保留数据，供后续刷新页面、重启应用或临时网络失败时继续查看。若远程详情失败但本地已有正文，详情页会展示本地保留正文作为回退。关键词过滤也会先检查已缓存正文，只有缓存缺失时才补走远程详情读取。
+
+Outlook/Hotmail OAuth 的 IMAP 回退链路默认按 UID 读取详情和附件；列表项、详情请求和附件下载可携带 `id_mode=uid|sequence`，避免 UID 与序列号混用导致取错邮件。标准 IMAP 账号继续使用其既有消息 ID 读取逻辑。
+
+当前阶段只保留普通邮箱列表元数据和已读取过的详情正文，不包含附件二进制、原始 MIME 内容的下载或保留；附件下载仍依赖当前远程提供商链路。设置页会显示已保存邮件数、已缓存正文数、估算保留大小和当前 SQLite 数据库大小，并提供独立“清理缓存”操作。关闭本地保留开关时，界面会先要求确认；确认后会通过后台清理任务删除普通邮箱本地保留数据，并显示清理状态。清理任务会拒绝重复启动、对 SQLite 短暂锁进行有限重试，前端状态轮询使用退避间隔减少长任务压力。更完整的范围说明见 [`docs/local-mail-retention.md`](docs/local-mail-retention.md)。
+
 ### Web 应用功能
 
 #### 核心功能
 - 🔐 **登录验证** - 密码保护的 Web 界面，支持在线修改密码
 - 📁 **分组管理** - 支持创建、编辑、删除邮箱分组，自定义分组颜色，支持分组级别代理设置
-- 🌐 **分组代理** - 每个分组可配置 HTTP/SOCKS5 代理
+- 🌐 **账号/分组代理** - 每个分组可配置 HTTP/SOCKS5 代理，单个账号也可设置代理并优先覆盖分组代理
 - 📧 **多邮箱管理** - 批量导入和管理 Outlook/Hotmail OAuth / IMAP 邮箱账号
 - 🪪 **别名管理** - 支持给单个邮箱配置多个别名邮箱，主邮箱和别名都可用于检索邮件和调用对外 API
 - 🔀 **别名高级用法** - 可将外部邮箱自动转发到本项目管理的邮箱 A，再把外部邮箱配置为 A 的别名，从而通过本项目统一读取邮件
@@ -175,7 +181,7 @@ services:
 - 🔥 **临时邮箱** - 集成 GPTMail + DuckMail + Cloudflare Temp Email，多提供商生成、导入、读取、查看详情，并支持 Cloudflare 全部邮件视图
 - ⚙️ **系统设置** - 在线修改密码、API Key 等
 - 🔄 **OAuth2 助手** - 内置授权流程，快速获取 Refresh Token
-- 💾 **邮件缓存** - 智能缓存邮件列表，切换即时展示
+- 💾 **邮件缓存** - 智能缓存邮件列表，切换即时展示；普通邮箱本地保留默认关闭，可在设置页开启、查看统计并清理本地保留缓存
 - 🏷️ **标签管理** - 支持给邮箱打标签、批量操作、按标签筛选
 - 📦 **批量移动分组** - 批量选择邮箱移动到指定分组
 - ✅ **批量选择** - 邮箱列表、邮件列表均支持全选当前列表与清空选择
@@ -272,7 +278,6 @@ Web 应用采用四栏式布局设计：
 - `Mail.ReadWrite` - 读写邮件
 - `User.Read` - 读取用户信息
 - `IMAP.AccessAsUser.All` - IMAP 访问
-
 #### 步骤 5：获取 Refresh Token
 
 使用本工具内置的 OAuth2 助手获取 Refresh Token：
@@ -373,6 +378,7 @@ user@example.com----app-password----imap.example.com----993
 
 - **刷新 Token**：只对 Outlook/Hotmail OAuth 账号可用；IMAP 账号不可刷新，按钮会按可刷新数量提示。
 - **复制邮箱+别名**：复制选中账号的主邮箱和已配置别名。
+- **导出**：二次验证后导出选中账号，适合先按标签或搜索筛选后只导出当前勾选的账号。
 - **开启转发 / 取消转发**：批量修改账号级转发开关。全局转发渠道仍需在「设置 -> 邮件转发设置」中配置。
 - **标签+ / 标签-**：给选中账号批量添加或移除一个标签。
 - **移动**：把选中账号移动到指定分组。
@@ -442,7 +448,26 @@ user@example.com----app-password----imap.example.com----993
 - 「手动上传」会立即上传真实备份文件，需要输入登录密码
 - WebDAV 备份涉及账号、令牌、临时邮箱凭据等敏感数据，建议使用专用 WebDAV 目录并控制访问权限
 
-### 8. 对外 API
+### 8. 浏览器扩展（密码版）
+
+仓库内置 Chrome / Edge Manifest V3 扩展，目录为 `browser-extension/`。扩展使用 Web 端登录密码，不需要对外 API Key。
+
+安装方式：
+
+1. 打开浏览器扩展管理页，例如 `chrome://extensions/` 或 `edge://extensions/`
+2. 开启开发者模式
+3. 选择“加载已解压的扩展程序”
+4. 选择本仓库的 `browser-extension` 目录
+
+使用方式：
+
+1. 点击扩展图标
+2. 填写 OutlookEmail 服务地址和 Web 登录密码
+3. 点击“保存配置”，或直接点侧边栏里的功能入口
+
+扩展会在浏览器侧边栏内提供原生操作面板，当前网页标签不会被切走。现在可直接使用邮箱、导入、刷新、Token、导出、标签和设置等功能。完整安装、配置、功能和故障排查说明见 [浏览器扩展使用说明](browser-extension/README.md)。
+
+### 9. 对外 API
 
 通过 API Key 直接获取邮件，无需登录 Web 界面。
 
@@ -454,6 +479,7 @@ user@example.com----app-password----imap.example.com----993
 - 支持特殊字符别名，例如 `user+alias@example.com`
 - 查询 `@gmail.com` / `@googlemail.com` 地址时，原后缀未命中会自动回退到另一个后缀
 - 默认 `top=1`
+- `skip` / `top` 会做安全解析：非数字使用默认值，负数按 `0` 处理；`top` 最大 `50`
 
 **配置步骤：**
 1. 点击「⚙️ 设置」→ 在「对外 API Key」处点击「🔑 随机生成」→ 保存

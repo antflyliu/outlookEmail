@@ -30,6 +30,7 @@
 - Git 标签：`vX.Y.Z`
 - GitHub Release：标题为 `vX.Y.Z`
 - Windows 桌面压缩包：`OutlookEmail-windows-x64-X.Y.Z.zip`
+- macOS 安装包：`OutlookEmail-macos-x64-X.Y.Z.dmg`、`OutlookEmail-macos-arm64-X.Y.Z.dmg`
 - Docker 镜像：`ghcr.io/assast/outlookemail:vX.Y.Z`
 
 补充说明：
@@ -45,9 +46,10 @@
 1. 目标提交已经合并到 `main`，且 `main` 处于可发布状态。
 2. `VERSION` 已更新为本次版本号。
 3. `CHANGELOG.md` 已新增本次版本条目，日期与内容完整。
-4. `README.md`、部署文档、升级文档中涉及的行为说明没有与当前实现冲突。
-5. 如本次改动影响 Docker、Windows `exe`、环境变量、API 或前端交互，已同步写入文档。
-6. 本地或 CI 已完成必要验证，至少确认核心功能没有明显回归。
+4. 如需向用户提示新增功能，已更新 `templates/partials/index/dialogs-management.html` 中的 `releaseNoticeModal` 文案。
+5. `README.md`、部署文档、升级文档中涉及的行为说明没有与当前实现冲突。
+6. 如本次改动影响 Docker、Windows `exe`、环境变量、API 或前端交互，已同步写入文档。
+7. 本地或 CI 已完成必要验证，至少确认核心功能没有明显回归。
 
 ## 标准发版步骤
 
@@ -65,6 +67,7 @@
 
 - `VERSION`
 - `CHANGELOG.md`
+- `templates/partials/index/dialogs-management.html` 中的 `releaseNoticeModal` 文案（如需提示用户新增功能）
 
 示例：
 
@@ -114,14 +117,20 @@ git push origin v2.0.16
 - 打包 `dist/OutlookEmail.exe`
 - 与 `README.md` 一起压缩为发布附件
 
-### 2. 创建并推送标签
+### 2. 构建 macOS DMG
+
+- 在 macOS x64 和 arm64 Runner 上运行 `scripts/build-macos-dmg.sh`
+- 使用 PyInstaller 生成 `OutlookEmail.app`
+- 使用 `hdiutil` 生成可拖拽安装的 DMG 发布附件
+
+### 3. 创建并推送标签
 
 - 手动触发时会自动创建 `vX.Y.Z`
 - tag push 触发时会直接复用当前推送的 `vX.Y.Z`
 - 如果同名标签已经存在且指向当前提交，会跳过创建
 - 如果同名标签存在但指向别的提交，工作流会失败并停止发布
 
-### 3. 生成 Release Notes
+### 4. 生成 Release Notes
 
 工作流会从 `CHANGELOG.md` 中提取当前版本对应的内容：
 
@@ -130,15 +139,15 @@ git push origin v2.0.16
 
 因此，正式发版前应确保 `CHANGELOG.md` 已提前写好该版本条目。
 
-### 4. 构建并推送 Docker 版本镜像
+### 5. 构建并推送 Docker 版本镜像
 
 工作流会调用 `docker-build-push.yml`，并基于标签 `refs/tags/vX.Y.Z` 构建：
 
 - `ghcr.io/assast/outlookemail:vX.Y.Z`
 
-### 5. 发布 GitHub Release
+### 6. 发布 GitHub Release
 
-最终会创建正式 Release，并上传 Windows 压缩包附件。
+最终会创建正式 Release，并上传 Windows 压缩包和 macOS DMG 附件。
 
 ## 发版后核对
 

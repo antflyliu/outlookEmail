@@ -1,9 +1,266 @@
-        /* global accountsCache, allTags, closeAllModals, currentGroupId, currentGroupName, deleteCurrentAccount, ensureForwardingSettingsUI, escapeHtml, formatAbsoluteDateTime, getSelectedForwardChannels, groups, handleApiError, hideEditAccountModal, hideModal, hideSettingsModal, isTempEmailGroup, isTempImportGroup, loadAccountsByGroup, loadGroups, loadTempEmails, normalizeSmtpForwardProvider, refreshVisibleAccountList, setAppTimeZone, setModalVisible, setSelectedForwardChannels, setShowAccountCreatedAt, setShowAccountSortOrder, setShowGroupId, showModal, showToast, syncSmtpProviderUI, toggleRefreshStrategy, updateEditAccountFields, updateImportHint */
+        /* global accountsCache, allTags, closeAllModals, closeMobilePanels, closeNavbarActionsMenu, currentGroupId, currentGroupName, deleteCurrentAccount, ensureForwardingSettingsUI, escapeHtml, formatAbsoluteDateTime, getSelectedForwardChannels, groups, handleApiError, hideEditAccountModal, hideModal, hideSettingsModal, invalidateNormalMailRetentionCaches, isTempEmailGroup, isTempImportGroup, loadAccountsByGroup, loadGroups, loadTempEmails, normalizeSmtpForwardProvider, refreshVisibleAccountList, setAppTimeZone, setModalVisible, setSelectedForwardChannels, setShowAccountCreatedAt, setShowAccountSortOrder, setShowGroupId, setNormalMailLocalRetentionEnabled, showConfirmModal, showModal, showToast, syncSmtpProviderUI, toggleRefreshStrategy, updateEditAccountFields, updateImportHint */
 
         // ==================== 设置相关 ====================
         let settingsScrollSyncBound = false;
         let settingsScrollSyncFrame = 0;
         let lastLoadedWebdavBackupSettings = null;
+        let lastNormalMailRetentionStatus = null;
+        let normalMailRetentionStatusPollTimer = null;
+        let normalMailRetentionStatusPollDelayMs = 0;
+        const NORMAL_MAIL_RETENTION_STATUS_INITIAL_POLL_MS = 2000;
+        const NORMAL_MAIL_RETENTION_STATUS_MAX_POLL_MS = 10000;
+        const LOCKED_ACCOUNT_SECRET_PLACEHOLDER = '已保存，验证后显示';
+        let editAccountSecretState = {
+            accountId: '',
+            pendingField: ''
+        };
+
+        function parseSettingsBoolean(value) {
+            return String(value).toLowerCase() === 'true';
+        }
+
+        function formatStorageBytes(bytes) {
+            const value = Number(bytes) || 0;
+            if (value < 1024) return `${value} B`;
+            if (value < 1024 * 1024) return `${(value / 1024).toFixed(1).replace(/\.0$/, '')} KB`;
+            if (value < 1024 * 1024 * 1024) return `${(value / 1024 / 1024).toFixed(1).replace(/\.0$/, '')} MB`;
+            return `${(value / 1024 / 1024 / 1024).toFixed(1).replace(/\.0$/, '')} GB`;
+        }
+
+        function resetEditSecretInput(inputId, buttonId, hasSavedValue, emptyPlaceholder = '') {
+            const input = document.getElementById(inputId);
+            const button = document.getElementById(buttonId);
+            if (!input) return;
+
+            input.value = '';
+            input.placeholder = hasSavedValue ? LOCKED_ACCOUNT_SECRET_PLACEHOLDER : emptyPlaceholder;
+            input.dataset.secretHasSaved = hasSavedValue ? 'true' : 'false';
+            input.dataset.secretLoaded = hasSavedValue ? 'false' : 'true';
+            if (button) {
+                button.style.display = hasSavedValue ? '' : 'none';
+            }
+        }
+
+        function setEditSecretInputValue(inputId, buttonId, value, emptyPlaceholder = '') {
+            const input = document.getElementById(inputId);
+            const button = document.getElementById(buttonId);
+            if (!input) return;
+
+            input.value = value || '';
+            input.placeholder = emptyPlaceholder;
+            input.dataset.secretHasSaved = input.value ? 'true' : 'false';
+            input.dataset.secretLoaded = 'true';
+            if (button) {
+                button.style.display = 'none';
+            }
+        }
+
+        function clearEditAccountSecrets() {
+            resetEditSecretInput('editPassword', 'revealEditPasswordBtn', false, '可选');
+            resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', false, '');
+            const verifyInput = document.getElementById('accountSecretVerifyPassword');
+            if (verifyInput) {
+                verifyInput.value = '';
+            }
+            editAccountSecretState = {
+                accountId: '',
+                pendingField: ''
+            };
+        }
+
+        function shouldSubmitSecretInput(input) {
+            return !!input && (input.dataset.secretLoaded === 'true' || !!input.value);
+        }
+
+        function showAccountSecretVerifyModal(fieldName) {
+            const accountId = document.getElementById('editAccountId')?.value || '';
+            if (!accountId) {
+                showToast('请先打开账号编辑窗口', 'error');
+                return;
+            }
+
+            editAccountSecretState.accountId = accountId;
+            editAccountSecretState.pendingField = fieldName || '';
+            closeNavbarActionsMenu();
+            closeMobilePanels();
+            setModalVisible('accountSecretVerifyModal', true);
+
+            const verifyInput = document.getElementById('accountSecretVerifyPassword');
+            if (verifyInput) {
+                verifyInput.value = '';
+                verifyInput.focus();
+            }
+        }
+
+        function hideAccountSecretVerifyModal() {
+            hideModal('accountSecretVerifyModal');
+            const verifyInput = document.getElementById('accountSecretVerifyPassword');
+            if (verifyInput) {
+                verifyInput.value = '';
+            }
+        }
+
+        async function confirmAccountSecretVerify() {
+            const accountId = editAccountSecretState.accountId || document.getElementById('editAccountId')?.value || '';
+            const verifyInput = document.getElementById('accountSecretVerifyPassword');
+            const password = verifyInput?.value || '';
+
+            if (!accountId) {
+                showToast('请先打开账号编辑窗口', 'error');
+                return;
+            }
+            if (!password) {
+                showToast('请输入登录密码', 'error');
+                return;
+            }
+
+            try {
+                const response = await fetch(`/api/accounts/${accountId}/secrets`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        password,
+                        field: editAccountSecretState.pendingField || ''
+                    })
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    handleApiError(data, '验证失败');
+                    return;
+                }
+
+                const secrets = data.secrets || {};
+                if (Object.prototype.hasOwnProperty.call(secrets, 'password')) {
+                    setEditSecretInputValue('editPassword', 'revealEditPasswordBtn', secrets.password || '', '可选');
+                }
+                if (Object.prototype.hasOwnProperty.call(secrets, 'imap_password')) {
+                    setEditSecretInputValue('editImapPassword', 'revealEditImapPasswordBtn', secrets.imap_password || '', '');
+                }
+                hideAccountSecretVerifyModal();
+                showToast('验证通过，已显示账号密码', 'success');
+            } catch (error) {
+                showToast('验证失败', 'error');
+            }
+        }
+
+        function updateNormalMailRetentionStats(status = {}) {
+            lastNormalMailRetentionStatus = status || {};
+            const savedCount = Number(status.saved_message_count || 0);
+            const cachedBodyCount = Number(status.cached_body_count || 0);
+            const clearStatus = status.clear_status || {};
+
+            const savedEl = document.getElementById('normalMailRetentionSavedCount');
+            const cachedEl = document.getElementById('normalMailRetentionCachedBodyCount');
+            const estimatedEl = document.getElementById('normalMailRetentionEstimatedBytes');
+            const dbEl = document.getElementById('normalMailRetentionDbBytes');
+            const clearEl = document.getElementById('normalMailRetentionClearStatus');
+            const errorEl = document.getElementById('normalMailRetentionStatsError');
+
+            if (savedEl) savedEl.textContent = String(savedCount);
+            if (cachedEl) cachedEl.textContent = String(cachedBodyCount);
+            if (estimatedEl) estimatedEl.textContent = formatStorageBytes(status.estimated_retained_bytes);
+            if (dbEl) dbEl.textContent = formatStorageBytes(status.db_file_bytes);
+            if (clearEl) clearEl.textContent = `清理状态：${clearStatus.message || clearStatus.state || '普通邮箱本地缓存清理空闲'}`;
+            if (errorEl) {
+                errorEl.style.display = 'none';
+                errorEl.textContent = '';
+            }
+
+            if (clearStatus.state === 'running') {
+                scheduleNormalMailRetentionStatusPoll();
+            } else {
+                stopNormalMailRetentionStatusPoll();
+            }
+        }
+
+        function renderNormalMailRetentionStatusError(message) {
+            const errorEl = document.getElementById('normalMailRetentionStatsError');
+            if (!errorEl) return;
+            errorEl.textContent = message || '加载普通邮箱本地保留统计失败';
+            errorEl.style.display = 'block';
+        }
+
+        function stopNormalMailRetentionStatusPoll() {
+            if (normalMailRetentionStatusPollTimer) {
+                window.clearTimeout(normalMailRetentionStatusPollTimer);
+                normalMailRetentionStatusPollTimer = null;
+            }
+            normalMailRetentionStatusPollDelayMs = 0;
+        }
+
+        function resetNormalMailRetentionStatusPollDelay() {
+            normalMailRetentionStatusPollDelayMs = NORMAL_MAIL_RETENTION_STATUS_INITIAL_POLL_MS;
+        }
+
+        function nextNormalMailRetentionStatusPollDelay() {
+            if (!normalMailRetentionStatusPollDelayMs) {
+                resetNormalMailRetentionStatusPollDelay();
+                return normalMailRetentionStatusPollDelayMs;
+            }
+            const delay = normalMailRetentionStatusPollDelayMs;
+            normalMailRetentionStatusPollDelayMs = Math.min(
+                NORMAL_MAIL_RETENTION_STATUS_MAX_POLL_MS,
+                normalMailRetentionStatusPollDelayMs * 1.5
+            );
+            return delay;
+        }
+
+        function scheduleNormalMailRetentionStatusPoll() {
+            if (normalMailRetentionStatusPollTimer) return;
+            normalMailRetentionStatusPollTimer = window.setTimeout(async () => {
+                normalMailRetentionStatusPollTimer = null;
+                await loadNormalMailRetentionStatus({ silent: true });
+            }, nextNormalMailRetentionStatusPollDelay());
+        }
+
+        async function loadNormalMailRetentionStatus(options = {}) {
+            try {
+                const response = await fetch('/api/settings/normal-mail-retention/status', { cache: 'no-store' });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '加载普通邮箱本地保留统计失败');
+                }
+                updateNormalMailRetentionStats(data.status || {});
+                return data.status || {};
+            } catch (error) {
+                if (!options.silent) {
+                    renderNormalMailRetentionStatusError(error.message || '加载普通邮箱本地保留统计失败');
+                }
+                return null;
+            }
+        }
+
+        async function clearNormalMailRetentionCache() {
+            const confirmed = await showConfirmModal(
+                '确定要清理普通邮箱本地缓存吗？这只会删除本机 SQLite 中保留的普通邮箱列表和正文缓存，不会关闭本地保留开关。',
+                { title: '清理普通邮箱本地缓存', confirmText: '确认清理' }
+            );
+            if (!confirmed) return false;
+            try {
+                const response = await fetch('/api/settings/normal-mail-retention/clear', { method: 'POST' });
+                const data = await response.json();
+                if (!response.ok || !data.success) {
+                    throw new Error(data.error || '启动普通邮箱本地缓存清理失败');
+                }
+                if (typeof invalidateNormalMailRetentionCaches === 'function') {
+                    invalidateNormalMailRetentionCaches({ resetCurrentView: true });
+                }
+                resetNormalMailRetentionStatusPollDelay();
+                updateNormalMailRetentionStats({
+                    ...(lastNormalMailRetentionStatus || {}),
+                    clear_status: data.status || { state: 'running', message: '正在清理普通邮箱本地缓存…' }
+                });
+                showToast(data.already_running ? '普通邮箱本地缓存正在清理中' : '已开始清理普通邮箱本地缓存', 'success');
+                scheduleNormalMailRetentionStatusPoll();
+                return true;
+            } catch (error) {
+                renderNormalMailRetentionStatusError(error.message || '启动普通邮箱本地缓存清理失败');
+                showToast('启动普通邮箱本地缓存清理失败', 'error');
+                return false;
+            }
+        }
+
 
         function getSettingsScrollContainer() {
             return document.querySelector('#settingsModal .settings-modal-body')
@@ -731,15 +988,20 @@
                 if (data.success) {
                     closeAllModals();
                     const acc = data.account;
+                    editAccountSecretState.accountId = String(acc.id || '');
+                    editAccountSecretState.pendingField = '';
                     document.getElementById('editAccountId').value = acc.id;
                     document.getElementById('editEmail').value = acc.email || '';
-                    document.getElementById('editPassword').value = acc.password || '';
+                    resetEditSecretInput('editPassword', 'revealEditPasswordBtn', !!acc.has_password, '可选');
                     document.getElementById('editClientId').value = acc.client_id || '';
                     document.getElementById('editRefreshToken').value = acc.refresh_token || '';
-                    document.getElementById('editImapPassword').value = acc.imap_password || '';
+                    resetEditSecretInput('editImapPassword', 'revealEditImapPasswordBtn', !!acc.has_imap_password, '');
                     document.getElementById('editImapHost').value = acc.imap_host || '';
                     document.getElementById('editImapPort').value = acc.imap_port || 993;
                     document.getElementById('editGroupSelect').value = acc.group_id || 1;
+                    document.getElementById('editProxyUrl').value = acc.proxy_url || '';
+                    document.getElementById('editFallbackProxyUrl1').value = acc.fallback_proxy_url_1 || '';
+                    document.getElementById('editFallbackProxyUrl2').value = acc.fallback_proxy_url_2 || '';
                     document.getElementById('editSortOrder').value = Number(acc.sort_order || 0);
                     document.getElementById('editRemark').value = acc.remark || '';
                     document.getElementById('editAliases').value = Array.isArray(acc.aliases) ? acc.aliases.join('\n') : '';
@@ -766,18 +1028,26 @@
             const isOutlook = provider === 'outlook';
             const imapPort = parseInt(document.getElementById('editImapPort')?.value || '993', 10);
             const sortOrder = parseInt(document.getElementById('editSortOrder')?.value || '0', 10);
+            const passwordInput = document.getElementById('editPassword');
+            const imapPasswordInput = document.getElementById('editImapPassword');
+            const imapPasswordValue = imapPasswordInput?.value || '';
+            const imapPasswordLockedWithSavedValue = (
+                imapPasswordInput?.dataset.secretHasSaved === 'true'
+                && imapPasswordInput?.dataset.secretLoaded !== 'true'
+            );
 
             const data = {
                 email: document.getElementById('editEmail').value.trim(),
-                password: document.getElementById('editPassword').value,
                 client_id: document.getElementById('editClientId').value.trim(),
                 refresh_token: document.getElementById('editRefreshToken').value.trim(),
                 account_type: isOutlook ? 'outlook' : 'imap',
                 provider,
                 imap_host: document.getElementById('editImapHost')?.value.trim() || '',
                 imap_port: Number.isFinite(imapPort) ? imapPort : 993,
-                imap_password: document.getElementById('editImapPassword')?.value || '',
                 group_id: newGroupId,
+                proxy_url: document.getElementById('editProxyUrl')?.value.trim() || '',
+                fallback_proxy_url_1: document.getElementById('editFallbackProxyUrl1')?.value.trim() || '',
+                fallback_proxy_url_2: document.getElementById('editFallbackProxyUrl2')?.value.trim() || '',
                 sort_order: Number.isFinite(sortOrder) ? Math.max(0, sortOrder) : 0,
                 remark: document.getElementById('editRemark').value.trim(),
                 aliases: document.getElementById('editAliases')?.value
@@ -787,6 +1057,12 @@
                 status: document.getElementById('editStatus').value,
                 forward_enabled: !!document.getElementById('editForwardEnabled')?.checked
             };
+            if (shouldSubmitSecretInput(passwordInput)) {
+                data.password = passwordInput.value;
+            }
+            if (shouldSubmitSecretInput(imapPasswordInput)) {
+                data.imap_password = imapPasswordValue;
+            }
 
             if (isOutlook) {
                 if (!data.email || !data.client_id || !data.refresh_token) {
@@ -794,7 +1070,7 @@
                     return;
                 }
             } else {
-                if (!data.email || !data.imap_password) {
+                if (!data.email || (!imapPasswordValue && !imapPasswordLockedWithSavedValue)) {
                     showToast('邮箱和 IMAP 密码不能为空', 'error');
                     return;
                 }
@@ -862,6 +1138,9 @@
                     document.getElementById('settingsShowAccountCreatedAt').checked = String(data.settings.show_account_created_at) !== 'false';
                     document.getElementById('settingsShowAccountSortOrder').checked = String(data.settings.show_account_sort_order) === 'true';
                     document.getElementById('settingsShowGroupId').checked = String(data.settings.show_group_id) !== 'false';
+                    const retentionEnabled = parseSettingsBoolean(data.settings.normal_mail_local_retention_enabled);
+                    document.getElementById('normalMailLocalRetentionEnabled').checked = retentionEnabled;
+                    setNormalMailLocalRetentionEnabled(retentionEnabled);
                     document.getElementById('forwardCheckIntervalMinutes').value = data.settings.forward_check_interval_minutes || '5';
                     document.getElementById('forwardAccountDelaySeconds').value = data.settings.forward_account_delay_seconds || '0';
                     document.getElementById('forwardEmailWindowMinutes').value = data.settings.forward_email_window_minutes || '0';
@@ -893,6 +1172,7 @@
                     document.querySelector('input[name="refreshStrategy"][value="' + (useCron ? 'cron' : 'days') + '"]').checked = true;
                     toggleRefreshStrategy();
                     syncSmtpProviderUI(false);
+                    await loadNormalMailRetentionStatus();
                 }
             } catch (error) {
                 showToast('加载设置失败', 'error');
@@ -913,6 +1193,7 @@
             const showAccountCreatedAt = !!document.getElementById('settingsShowAccountCreatedAt')?.checked;
             const showAccountSortOrder = !!document.getElementById('settingsShowAccountSortOrder')?.checked;
             const showGroupId = !!document.getElementById('settingsShowGroupId')?.checked;
+            const normalMailLocalRetentionEnabled = !!document.getElementById('normalMailLocalRetentionEnabled')?.checked;
             const settings = {};
             const forwardChannels = getSelectedForwardChannels();
 
@@ -1036,6 +1317,7 @@
             settings.show_account_created_at = showAccountCreatedAt;
             settings.show_account_sort_order = showAccountSortOrder;
             settings.show_group_id = showGroupId;
+            settings.normal_mail_local_retention_enabled = normalMailLocalRetentionEnabled;
             settings.forward_channels = forwardChannels;
             settings.forward_check_interval_minutes = forwardMinutes;
             settings.forward_account_delay_seconds = forwardAccountDelaySeconds;
@@ -1068,6 +1350,22 @@
                 settings.refresh_cron = refreshCron;
             }
 
+            const savedMessageCount = Number(lastNormalMailRetentionStatus?.saved_message_count || 0);
+            const wasRetentionEnabled = isNormalMailLocalRetentionEnabled();
+            let shouldClearNormalMailRetentionCache = false;
+            if (wasRetentionEnabled && !normalMailLocalRetentionEnabled && savedMessageCount > 0) {
+                const confirmed = await showConfirmModal(
+                    '关闭普通邮箱本地保留将清理已保存的普通邮箱本地缓存数据。此操作不可恢复，是否继续？',
+                    { title: '关闭普通邮箱本地保留', confirmText: '确认关闭并清理' }
+                );
+                if (!confirmed) {
+                    const switchEl = document.getElementById('normalMailLocalRetentionEnabled');
+                    if (switchEl) switchEl.checked = true;
+                    return;
+                }
+                shouldClearNormalMailRetentionCache = true;
+            }
+
             let data;
             try {
                 const response = await fetch('/api/settings', {
@@ -1091,6 +1389,33 @@
             setShowAccountCreatedAt(showAccountCreatedAt);
             setShowAccountSortOrder(showAccountSortOrder);
             setShowGroupId(showGroupId);
+            setNormalMailLocalRetentionEnabled(normalMailLocalRetentionEnabled);
+            if (wasRetentionEnabled && !normalMailLocalRetentionEnabled
+                && typeof invalidateNormalMailRetentionCaches === 'function') {
+                invalidateNormalMailRetentionCaches({ resetCurrentView: true });
+            }
+            if (shouldClearNormalMailRetentionCache) {
+                try {
+                    const clearResponse = await fetch('/api/settings/normal-mail-retention/clear', { method: 'POST' });
+                    const clearData = await clearResponse.json();
+                    if (!clearResponse.ok || !clearData.success) {
+                        throw new Error(clearData.error || '启动普通邮箱本地缓存清理失败');
+                    }
+                    if (typeof invalidateNormalMailRetentionCaches === 'function') {
+                        invalidateNormalMailRetentionCaches({ resetCurrentView: true });
+                    }
+                    resetNormalMailRetentionStatusPollDelay();
+                    updateNormalMailRetentionStats({
+                        ...(lastNormalMailRetentionStatus || {}),
+                        clear_status: clearData.status || { state: 'running', message: '正在清理普通邮箱本地缓存…' }
+                    });
+                    scheduleNormalMailRetentionStatusPoll();
+                } catch (error) {
+                    showToast('设置已保存，但启动普通邮箱本地缓存清理失败', 'warning');
+                }
+            } else {
+                await loadNormalMailRetentionStatus({ silent: true });
+            }
             try {
                 await loadGroups();
                 await refreshVisibleAccountList(false);

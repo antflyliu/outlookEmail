@@ -9,6 +9,7 @@
 - 接口分为两类：
   - 对外 API：`/api/external/*`，使用 API Key
   - 完整管理 API：其余 `/api/*`，先登录 Web，再带 Session Cookie
+- 浏览器扩展可以使用 `POST /api/extension/login` 通过 Web 登录密码换取一次性跳转地址，再建立正常 Web Session
 - 写操作默认使用 JSON 请求体，`Content-Type: application/json`
 - 大多数接口返回 JSON；少数接口返回文件下载或 SSE 事件流
 
@@ -27,6 +28,8 @@
 | --- | --- | --- | --- | --- |
 | GET | `/api/version-status` | Session | JSON | 当前版本与仓库版本状态 |
 | GET | `/api/csrf-token` | Session | JSON | 获取当前登录会话对应的 CSRF Token |
+| POST | `/api/extension/login` | Web 登录密码 | JSON | 浏览器扩展获取一次性登录跳转地址 |
+| GET | `/extension-login/<token>` | 一次性 token | Redirect | 消费扩展登录 token，建立 Web Session 后跳转 |
 
 ### 对外 API
 
@@ -49,10 +52,11 @@
 | POST | `/api/export/verify` | Session + CSRF | JSON | 获取导出二次验证令牌 |
 | GET | `/api/groups/<group_id>/export` | Session | `text/plain` 下载 | 导出单个分组账号 |
 | GET | `/api/accounts/export` | Session | `text/plain` 下载 | 导出全部账号 |
-| POST | `/api/accounts/export-selected` | Session + CSRF | `text/plain` 下载 | 导出选中分组账号 |
+| POST | `/api/accounts/export-selected` | Session + CSRF | `text/plain` 下载 | 导出选中分组或选中账号 |
 | GET | `/api/accounts` | Session | JSON | 获取账号列表 |
 | GET | `/api/accounts/search` | Session | JSON | 搜索账号 |
-| GET | `/api/accounts/<account_id>` | Session | JSON | 获取单个账号 |
+| GET | `/api/accounts/<account_id>` | Session | JSON | 获取单个账号，不返回账号密码和 IMAP 密码明文 |
+| POST | `/api/accounts/<account_id>/secrets` | Session + CSRF | JSON | 二次验证后获取账号密码和 IMAP 密码 |
 | POST | `/api/accounts` | Session + CSRF | JSON | 批量导入账号 |
 | PUT | `/api/accounts/<account_id>` | Session + CSRF | JSON | 更新账号 |
 | DELETE | `/api/accounts/<account_id>` | Session + CSRF | JSON | 按 ID 删除账号 |
@@ -62,6 +66,7 @@
 | PUT | `/api/accounts/<account_id>/aliases` | Session + CSRF | JSON | 整体替换账号别名 |
 | POST | `/api/accounts/batch-update-group` | Session + CSRF | JSON | 批量改分组 |
 | POST | `/api/accounts/batch-update-forwarding` | Session + CSRF | JSON | 批量改转发开关 |
+| POST | `/api/accounts/batch-update-proxy` | Session + CSRF | JSON | 批量改账号级代理 |
 | GET | `/api/tags` | Session | JSON | 获取标签列表 |
 | POST | `/api/tags` | Session + CSRF | JSON | 创建标签 |
 | DELETE | `/api/tags/<tag_id>` | Session + CSRF | JSON | 删除标签 |
@@ -108,6 +113,9 @@
 | GET | `/api/email/<email_addr>/<message_id>` | Session | JSON | 获取邮件详情 |
 | GET | `/api/email/<email_addr>/<message_id>/attachments/<attachment_id>` | Session | 文件流 | 下载附件 |
 | GET | `/api/email/<email_addr>/<message_id>/attachments/download-all` | Session | ZIP 文件流 | 打包下载全部附件 |
+| POST | `/api/emails/retain-bodies` | Session + CSRF | JSON | 为已保留普通邮箱列表行补齐正文缓存 |
+| GET | `/api/settings/normal-mail-retention/status` | Session | JSON | 获取普通邮箱本地保留统计与清理状态 |
+| POST | `/api/settings/normal-mail-retention/clear` | Session + CSRF | JSON | 启动普通邮箱本地保留缓存清理 |
 | GET | `/api/temp-emails` | Session | JSON | 获取临时邮箱列表 |
 | POST | `/api/temp-emails/import` | Session + CSRF | JSON | 批量导入临时邮箱 |
 | POST | `/api/temp-emails/batch-delete` | Session + CSRF | JSON | 批量删除临时邮箱 |
@@ -144,6 +152,35 @@
 
 完整 API 需要先登录 Web 界面并携带 Session Cookie。
 
+### 浏览器扩展密码登录
+
+浏览器扩展不使用对外 API Key。扩展先调用 `POST /api/extension/login`，用 Web 登录密码换取 60 秒有效的一次性 `launch_url`；随后在浏览器标签页打开该 URL，服务端会在自身域名下写入正常 Web Session 并跳转到 Web 控制台。
+
+请求体：
+
+```json
+{
+  "password": "web-login-password",
+  "next": "/#settings"
+}
+```
+
+成功响应：
+
+```json
+{
+  "success": true,
+  "launch_url": "/extension-login/<token>?next=/%23settings",
+  "expires_in": 60
+}
+```
+
+说明：
+
+- `next` 可选，必须是站内路径；非法值会回退到 `/`
+- `launch_url` 只能消费一次，过期或重复打开会跳回登录页
+- 扩展打开控制台后，后续 Web 页面仍按完整管理 API 的 Session + CSRF 规则工作
+
 ### CSRF
 
 所有内部写操作默认都应带 `X-CSRFToken` 请求头，值来自 `GET /api/csrf-token`。
@@ -155,6 +192,30 @@ Content-Type: application/json
 X-CSRFToken: <csrf-token>
 Cookie: session=<session-cookie>
 ```
+
+### 账号密码二次验证
+
+`GET /api/accounts/<account_id>` 只返回 `has_password` 和 `has_imap_password` 标记，不返回账号密码或 IMAP 密码明文。需要展示密码时，调用 `POST /api/accounts/<account_id>/secrets` 并在 JSON 请求体中传入当前 Web 登录密码。`field` 可选值为 `password` 或 `imap_password`，用于只获取当前要展示的密码字段；不传 `field` 时兼容返回两个字段：
+
+```json
+{
+  "password": "web-login-password",
+  "field": "password"
+}
+```
+
+验证成功后返回：
+
+```json
+{
+  "success": true,
+  "secrets": {
+    "password": "account-password"
+  }
+}
+```
+
+更新账号时，如果请求体省略 `password` 或 `imap_password` 字段，后端会保留已有值；只有显式传入该字段时才会更新对应密码。
 
 ### 通用响应约定
 
@@ -388,8 +449,8 @@ curl -X POST \
 | --- | --- | --- | --- |
 | `email` | string | 是 | 主邮箱或别名邮箱；若包含 `+`，会先按完整地址匹配，未命中时再按本地部分从右到左逐级去掉 `+suffix` 回退匹配；若域名是 `gmail.com` 或 `googlemail.com`，原后缀候选都未命中后会回退到另一个后缀 |
 | `folder` | string | 否 | `inbox`、`junkemail`、`deleteditems`、`all`。`all` 会同时抓取收件箱和垃圾邮件并按时间倒序合并 |
-| `skip` | int | 否 | 分页偏移，默认 `0`。当 `folder=all` 时，对每个文件夹分别跳过 `skip` 封 |
-| `top` | int | 否 | 返回数量，默认 `1`，最大 `50`。当 `folder=all` 时，表示每个文件夹各取 `top` 封 |
+| `skip` | int | 否 | 分页偏移，默认 `0`；非数字使用默认值，负数按 `0` 处理。当 `folder=all` 时，对每个文件夹分别跳过 `skip` 封 |
+| `top` | int | 否 | 返回数量，默认 `1`，最大 `50`；非数字使用默认值，负数按 `0` 处理。当 `folder=all` 时，表示每个文件夹各取 `top` 封 |
 | `subject_contains` | string | 否 | 仅保留主题中包含该关键字的邮件 |
 | `from_contains` | string | 否 | 仅保留发件人中包含该关键字的邮件 |
 | `keyword` | string | 否 | 在主题、预览、正文中做进一步关键字过滤 |
@@ -445,6 +506,7 @@ curl -H "X-API-Key: your-api-key" \
 - `top` 是“每个文件夹各取多少封”
 - 例如 `top=1` 时，最多返回 `收件箱 1 + 垃圾邮件 1 = 2` 封
 - `skip` 也是“每个文件夹各跳过多少封”
+- `top=0` 是合法的安全解析结果，会返回空列表而不是回退到默认数量
 - 结果按标准化后的邮件时间统一倒序排序
 - IMAP 场景会优先使用服务器返回的 `INTERNALDATE`；同时兼容 `Tue, 14 Apr 2026 08:20:50 +0000 (UTC)` 这类时间格式
 - 每条邮件会带上 `folder`
@@ -651,7 +713,7 @@ curl -X POST \
 | POST | `/api/export/verify` | JSON: `password` | JSON，返回 `verify_token` |
 | GET | `/api/groups/<group_id>/export` | Query: `verify_token` | `text/plain` 文件下载 |
 | GET | `/api/accounts/export` | Query: `verify_token` | `text/plain` 文件下载 |
-| POST | `/api/accounts/export-selected` | JSON: `group_ids: number[]`、`verify_token` | `text/plain` 文件下载 |
+| POST | `/api/accounts/export-selected` | JSON: `group_ids: number[]` 或 `account_ids: number[]`、`verify_token` | `text/plain` 文件下载 |
 
 二次验证请求示例：
 
@@ -707,7 +769,7 @@ curl -X POST \
 
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
-| `q` | string | 是 | 搜索关键词，支持主邮箱、备注、标签、别名邮箱 |
+| `q` | string | 是 | 搜索关键词，支持主邮箱、备注、标签、别名邮箱；输入多个关键词时可用空格或换行分隔，任一关键词命中即返回，最多 `200` 个关键词 |
 | `limit` | int | 否 | 单页条数，最大 `10000` |
 | `offset` | int | 否 | 分页偏移量，默认 `0` |
 | `sort_by` | string | 否 | 排序字段，支持 `created_at`、`email`、`sort_order` |
@@ -734,6 +796,9 @@ curl -X POST \
 | `remark` | string | 否 | 本次新增账号统一备注，不改变 `account_string` 每行格式 |
 | `status` | string | 否 | 本次新增账号统一状态：`active` 或 `inactive` |
 | `tag_ids` | array | 否 | 本次新增账号统一绑定的标签 ID 列表 |
+| `proxy_url` | string | 否 | 本次新增账号统一使用的账号级主代理；留空继承分组代理 |
+| `fallback_proxy_url_1` | string | 否 | 本次新增账号统一使用的账号级回退代理 1 |
+| `fallback_proxy_url_2` | string | 否 | 本次新增账号统一使用的账号级回退代理 2 |
 
 #### 响应重点字段
 
@@ -762,13 +827,18 @@ curl -X POST \
   "forward_enabled": false,
   "remark": "批次 A",
   "status": "active",
-  "tag_ids": [1, 2]
+  "tag_ids": [1, 2],
+  "proxy_url": "socks5://127.0.0.1:1080",
+  "fallback_proxy_url_1": "direct",
+  "fallback_proxy_url_2": ""
 }
 ```
 
 ### GET `/api/accounts/<account_id>`
 
 获取单个账号详情。
+
+账号详情不会返回 `password` 或 `imap_password` 明文，只返回 `has_password` 和 `has_imap_password` 标记。需要查看已保存的账号密码时，必须调用 `POST /api/accounts/<account_id>/secrets` 并传入当前 Web 登录密码完成二次验证。
 
 #### 响应补充字段
 
@@ -778,10 +848,43 @@ curl -X POST \
   "account": {
     "id": 1,
     "email": "user@outlook.com",
+    "has_password": true,
+    "has_imap_password": false,
+    "client_id": "xxx",
+    "refresh_token": "xxx",
     "aliases": ["alias@example.com", "login@example.com"],
     "alias_count": 2,
     "matched_alias": "",
-    "forward_enabled": true
+    "forward_enabled": true,
+    "proxy_url": "socks5://127.0.0.1:1080",
+    "fallback_proxy_url_1": "direct",
+    "fallback_proxy_url_2": "",
+    "proxy_override_enabled": true
+  }
+}
+```
+
+#### 查看密码
+
+```http
+POST /api/accounts/1/secrets
+Content-Type: application/json
+```
+
+```json
+{
+  "password": "web-login-password",
+  "field": "password"
+}
+```
+
+`field` 可选值为 `password` 或 `imap_password`；不传 `field` 时兼容返回两个密码字段。验证通过后返回：
+
+```json
+{
+  "success": true,
+  "secrets": {
+    "password": "account-password"
   }
 }
 ```
@@ -793,6 +896,7 @@ curl -X POST \
 - 若请求体只有 `status`，则只更新账号状态
 - 支持 Outlook 账号和 IMAP 账号
 - 现在支持直接在更新账号时一起保存别名
+- `proxy_url`、`fallback_proxy_url_1`、`fallback_proxy_url_2` 未传时保留账号现有代理配置；显式传空字符串可清空账号覆盖
 
 #### 请求体常用字段
 
@@ -811,6 +915,9 @@ curl -X POST \
 | `remark` | string | 否 | 备注 |
 | `status` | string | 否 | `active` 等状态值 |
 | `forward_enabled` | bool | 否 | 是否开启转发 |
+| `proxy_url` | string | 否 | 账号级主代理；留空且回退代理也为空时继承分组代理 |
+| `fallback_proxy_url_1` | string | 否 | 账号级回退代理 1，支持 `direct` / `直连` |
+| `fallback_proxy_url_2` | string | 否 | 账号级回退代理 2，支持 `direct` / `直连` |
 | `aliases` | array<string> | 否 | 账号别名列表；若传入则按新列表整体替换 |
 
 #### 请求示例
@@ -824,6 +931,9 @@ curl -X POST \
   "remark": "主账号",
   "status": "active",
   "forward_enabled": true,
+  "proxy_url": "socks5://127.0.0.1:1080",
+  "fallback_proxy_url_1": "direct",
+  "fallback_proxy_url_2": "",
   "aliases": [
     "alias@example.com",
     "login@example.com"
@@ -871,6 +981,39 @@ curl -X POST \
 | `updated_count` | 实际状态发生变化的账号数量 |
 | `updated_accounts` | 被更新的账号列表 |
 | `unchanged_count` | 原本就处于目标状态的账号数量 |
+| `missing_ids` | 未命中的账号 ID |
+
+### POST `/api/accounts/batch-update-proxy`
+
+批量设置或清空账号级代理。账号级代理三项全空时，该账号会继续继承所属分组代理；任一项非空时，账号级配置优先于分组配置。
+
+#### 请求体
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `account_ids` | array<int> | 是 | 账号 ID 列表 |
+| `proxy_url` | string | 否 | 账号级主代理，支持 `direct` / `直连` |
+| `fallback_proxy_url_1` | string | 否 | 回退代理 1 |
+| `fallback_proxy_url_2` | string | 否 | 回退代理 2 |
+
+#### 请求示例
+
+```json
+{
+  "account_ids": [1, 2, 3],
+  "proxy_url": "socks5://127.0.0.1:1080",
+  "fallback_proxy_url_1": "direct",
+  "fallback_proxy_url_2": ""
+}
+```
+
+#### 响应重点字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `updated_count` | 实际代理配置发生变化的账号数量 |
+| `updated_accounts` | 被更新的账号列表 |
+| `unchanged_count` | 原本就处于目标代理配置的账号数量 |
 | `missing_ids` | 未命中的账号 ID |
 
 ### GET `/api/accounts/<account_id>/aliases`
@@ -1455,8 +1598,10 @@ curl -X POST \
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `folder` | string | 否 | `inbox`、`junkemail`、`deleteditems`、`all` |
-| `skip` | int | 否 | 分页偏移，默认 `0` |
-| `top` | int | 否 | 返回数量，默认 `20` |
+| `skip` | int | 否 | 分页偏移，默认 `0`；非数字使用默认值，负数按 `0` 处理 |
+| `top` | int | 否 | 返回数量，默认 `20`；非数字使用默认值，负数按 `0` 处理。远程读取最大 `50`，本地保留读取不额外截断 |
+| `source` | string | 否 | 传 `local` 时只读取普通邮箱本地保留列表；需要 `normal_mail_local_retention_enabled=true` |
+| `local_only` | bool | 否 | `1` / `true` / `yes` / `on` 等价于 `source=local` |
 | `subject_contains` | string | 否 | 仅保留主题中包含该关键字的邮件，读取时保留 `+` 字符 |
 | `from_contains` | string | 否 | 仅保留发件人中包含该关键字的邮件，读取时保留 `+` 字符 |
 | `keyword` | string | 否 | 在主题、预览、正文中做进一步关键字过滤，读取时保留 `+` 字符 |
@@ -1480,6 +1625,7 @@ curl -X POST \
 | `has_attachments` | bool | 是否有附件 |
 | `body_preview` | string | 邮件预览 |
 | `folder` | string | 所属文件夹 |
+| `id_mode` | string | 消息 ID 模式：Graph 为 `graph`，OAuth IMAP 常见为 `uid` 或 `sequence`，用于详情、标记已读和附件下载复用同一种 ID 语义 |
 
 ### GET `/api/email/<email_addr>/<message_id>`
 
@@ -1490,7 +1636,10 @@ curl -X POST \
 | 参数 | 类型 | 必填 | 说明 |
 | --- | --- | --- | --- |
 | `folder` | string | 否 | 当前邮件所在文件夹，默认 `inbox` |
-| `method` | string | 否 | 优先取详情的方式，常见为 `graph` |
+| `method` | string | 否 | 优先取详情的方式，常见为 `graph`；传 `imap` 可走 Outlook OAuth IMAP 回退 |
+| `id_mode` | string | 否 | OAuth IMAP 消息 ID 模式，支持 `uid`、`sequence`；缺省或非法值按 `uid` 处理 |
+| `source` | string | 否 | 传 `local` 时优先返回已缓存的本地保留详情正文 |
+| `prefer_local` | bool | 否 | `1` / `true` / `yes` / `on` 等价于 `source=local` |
 
 #### 返回字段
 
@@ -1529,6 +1678,7 @@ curl -X POST \
 | --- | --- | --- | --- |
 | `folder` | string | 否 | 当前邮件所在文件夹，默认 `inbox` |
 | `method` | string | 否 | Outlook 账号优先使用 `graph`，传 `imap` 时走 IMAP 下载 |
+| `id_mode` | string | 否 | OAuth IMAP 附件下载使用的消息 ID 模式，支持 `uid`、`sequence`；缺省按 `uid` 处理 |
 
 ### GET `/api/email/<email_addr>/<message_id>/attachments/download-all`
 
@@ -1542,6 +1692,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | --- | --- | --- | --- |
 | `folder` | string | 否 | 当前邮件所在文件夹，默认 `inbox` |
 | `method` | string | 否 | Outlook 账号优先使用 `graph`，传 `imap` 时走 IMAP 下载 |
+| `id_mode` | string | 否 | OAuth IMAP 附件下载使用的消息 ID 模式，支持 `uid`、`sequence`；缺省按 `uid` 处理 |
 
 ### POST `/api/emails/mark-read`
 
@@ -1608,6 +1759,31 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `updated_ids` | 已成功更新的邮件 ID 列表 |
 | `errors` | 失败详情列表 |
 | `error` | 第一条失败信息，兼容旧前端逻辑 |
+
+### POST `/api/emails/retain-bodies`
+
+为已保留的普通邮箱列表行补齐详情正文缓存，供本地优先列表、新邮件提示合并后和后续离线详情回退使用。该接口只在 `normal_mail_local_retention_enabled=true` 时执行；关闭时返回 `local_retention_enabled=false` 并跳过所有项目。
+
+#### 请求字段
+
+| 字段 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 是 | 普通邮箱账号地址或别名地址 |
+| `folder` | string | 否 | 默认文件夹，默认 `inbox`；单个 `items` 项可覆盖 |
+| `method` | string | 否 | 默认读取方式，默认 `graph`；单个 `items` 项可覆盖 |
+| `items` | array | 否 | 待补齐的列表项。每项可包含 `id` / `message_id`、`folder`、`method`、`id_mode` |
+| `ids` | array | 否 | 兼容旧调用；当未传 `items` 时作为待补齐 ID 列表 |
+
+#### 响应字段
+
+| 字段 | 说明 |
+| --- | --- |
+| `cached_count` | 本次成功补齐正文的数量 |
+| `skipped_count` | 已有缓存、参数不完整或超出服务端上限而跳过的数量 |
+| `failed_count` | 远程详情读取失败的数量 |
+| `limit` | 单次最多补齐的服务端上限 |
+| `results` | 单项补齐结果 |
+| `errors` | 单项失败原因 |
 
 ### POST `/api/emails/delete`
 
@@ -1791,6 +1967,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `smtp_use_ssl` | 是否启用 SSL |
 | `telegram_bot_token` | Telegram Bot Token |
 | `telegram_chat_id` | Telegram Chat ID |
+| `normal_mail_local_retention_enabled` | 是否启用普通邮箱本地保留 |
 
 ### PUT `/api/settings`
 
@@ -1811,6 +1988,7 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
 | `show_account_created_at` | bool | 是否在邮箱列表展示创建时间 |
 | `show_account_sort_order` | bool | 是否在邮箱列表展示自定义排序值 |
 | `external_api_key` | string | 对外 API Key，可传空字符串清空 |
+| `normal_mail_local_retention_enabled` | bool/string | 是否启用普通邮箱本地保留；通过 `/api/settings` 更新会同步刷新后端进程内读取缓存 |
 
 #### 临时邮箱服务相关字段
 
@@ -1851,6 +2029,50 @@ ZIP 内文件名使用附件原始文件名；如果多个附件同名，会自�
   "forward_include_junkemail": true,
   "smtp_provider": "outlook",
   "forward_channels": ["smtp", "telegram"]
+}
+```
+
+### GET `/api/settings/normal-mail-retention/status`
+
+获取普通邮箱本地保留统计和清理任务状态。
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "status": {
+    "enabled": true,
+    "saved_message_count": 128,
+    "cached_body_count": 42,
+    "estimated_retained_bytes": 1048576,
+    "db_file_bytes": 5242880,
+    "clear_status": {
+      "state": "idle",
+      "message": ""
+    }
+  }
+}
+```
+
+`clear_status.state` 可能为 `idle`、`running`、`succeeded` 或 `failed`。统计值用于界面展示和清理决策，不是精确配额。
+
+### POST `/api/settings/normal-mail-retention/clear`
+
+启动后台清理任务，删除 `retained_normal_mail_messages` 中的普通邮箱本地保留数据。该接口不会自动关闭 `normal_mail_local_retention_enabled`；关闭开关由 `PUT /api/settings` 独立完成。
+
+清理任务是进程内状态：重复请求不会启动第二个删除线程，而是返回当前 `running` 状态并带 `already_running=true`。后台删除遇到短暂 SQLite `database is locked` 会有限重试；最终结果通过 status 接口轮询。
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "already_running": false,
+  "status": {
+    "state": "running",
+    "message": "正在清理普通邮箱本地保留缓存"
+  }
 }
 ```
 
@@ -1899,7 +2121,7 @@ Telegram 测试：
 
 ### 代理使用
 
-账号邮箱相关 API 当前会优先继承账号所属分组的 `proxy_url`：
+账号邮箱相关 API 当前会优先使用账号级代理配置；账号 `proxy_url`、`fallback_proxy_url_1`、`fallback_proxy_url_2` 三项全空时，才继承账号所属分组的代理配置：
 
 - Graph token 获取
 - Graph 邮件列表

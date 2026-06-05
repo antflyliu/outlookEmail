@@ -24,6 +24,12 @@
                                     </button>
                                 </li>
                                 <li>
+                                    <button type="button" class="settings-sidebar-link" data-target="settingsNormalMailRetentionSection" onclick="scrollSettingsSection('settingsNormalMailRetentionSection', this)">
+                                        <strong>普通邮箱本地保留</strong>
+                                        <span>开关、空间统计与缓存清理</span>
+                                    </button>
+                                </li>
+                                <li>
                                     <button type="button" class="settings-sidebar-link" data-target="settingsWebdavBackupSection" onclick="scrollSettingsSection('settingsWebdavBackupSection', this)">
                                         <strong>WebDAV 备份</strong>
                                         <span>导出全部分组并按 Cron 上传</span>
@@ -187,6 +193,47 @@
                                 <div id="cronValidationResult" class="settings-note" style="display: none;"></div>
                             </div>
                         </div>
+                    </div>
+                </section>
+
+                <section class="settings-section" id="settingsNormalMailRetentionSection">
+                    <div class="settings-section-head">
+                        <span class="settings-section-kicker">Retention</span>
+                        <h4>普通邮箱本地保留</h4>
+                        <p>控制 Outlook/IMAP 普通邮箱列表元数据与部分正文是否保存到本机 SQLite。</p>
+                    </div>
+                    <div class="settings-panel settings-panel-stack">
+                        <div class="settings-panel-grid settings-panel-grid--compact">
+                            <div class="form-group settings-form-span-full">
+                                <label class="settings-toggle settings-toggle--card">
+                                    <input type="checkbox" id="normalMailLocalRetentionEnabled">
+                                    <span class="form-label">启用普通邮箱本地保留</span>
+                                </label>
+                                <div class="form-hint" id="normalMailLocalRetentionExplanation">默认关闭。开启后，普通 Outlook/IMAP 邮箱的列表元数据和已查看的部分正文会保存到本机 SQLite，用于本地优先加载与离线回看；不会保存附件二进制或原始 MIME。</div>
+                            </div>
+                        </div>
+
+                        <div class="settings-subpanel" id="normalMailRetentionStats">
+                            <div class="settings-action-row settings-action-row--toolbar">
+                                <div>
+                                    <label class="form-label">存储统计</label>
+                                    <div class="form-hint" id="normalMailRetentionStatsError" style="display: none;"></div>
+                                </div>
+                                <button class="btn btn-secondary" type="button" id="refreshNormalMailRetentionStatusBtn" onclick="loadNormalMailRetentionStatus()">刷新统计</button>
+                            </div>
+                            <div class="settings-panel-grid settings-panel-grid--compact">
+                                <div class="settings-note">已保存邮件：<strong id="normalMailRetentionSavedCount">0</strong></div>
+                                <div class="settings-note">已缓存正文：<strong id="normalMailRetentionCachedBodyCount">0</strong></div>
+                                <div class="settings-note">估算占用空间：<strong id="normalMailRetentionEstimatedBytes">0 B</strong></div>
+                                <div class="settings-note">SQLite 数据库大小：<strong id="normalMailRetentionDbBytes">0 B</strong></div>
+                            </div>
+                        </div>
+
+                        <div class="settings-action-row settings-action-row--toolbar">
+                            <button class="btn btn-danger" type="button" id="clearNormalMailRetentionCacheBtn" onclick="clearNormalMailRetentionCache()">清理普通邮箱本地缓存</button>
+                            <div class="form-hint">独立清理本地保留的普通邮箱列表与正文缓存，不会修改上方开关。</div>
+                        </div>
+                        <div id="normalMailRetentionClearStatus" class="settings-note">清理状态：普通邮箱本地缓存清理空闲</div>
                     </div>
                 </section>
 
@@ -800,6 +847,38 @@
             </div>
         </div>
     </div>
+    <!-- 批量代理设置模态框 -->
+    <div class="modal" id="batchProxyModal" onmousedown="if(event.target === this) hideBatchProxyModal()">
+        <div class="modal-content" style="width: 460px;">
+            <div class="modal-header">
+                <h3>设置账号代理</h3>
+                <button class="modal-close" onclick="hideBatchProxyModal()">&times;</button>
+            </div>
+            <div class="modal-body">
+                <div class="form-group">
+                    <label class="form-label">账号代理</label>
+                    <input type="text" class="form-input" id="batchProxyUrl"
+                        placeholder="http://host:port、socks5://host:port 或 direct">
+                    <div class="form-hint">应用到已勾选账号；留空并提交会清空账号级代理，改为继承分组代理。</div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">回退代理 1</label>
+                    <input type="text" class="form-input" id="batchFallbackProxyUrl1"
+                        placeholder="http://host:port、socks5://host:port 或 direct">
+                </div>
+                <div class="form-group">
+                    <label class="form-label">回退代理 2</label>
+                    <input type="text" class="form-input" id="batchFallbackProxyUrl2"
+                        placeholder="http://host:port、socks5://host:port 或 direct">
+                    <div class="form-hint">填写 <code>direct</code> 或 <code>直连</code> 可显式直连。</div>
+                </div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideBatchProxyModal()">取消</button>
+                <button class="btn btn-primary" onclick="confirmBatchProxy()">确认设置</button>
+            </div>
+        </div>
+    </div>
     <!-- Error 详情模态框 -->
     <div class="modal" id="errorDetailModal" onmousedown="if(event.target === this) hideErrorDetailModal()">
         <div class="modal-content" style="width: 700px; max-width: 90vw;">
@@ -918,6 +997,50 @@
             </div>
             <div class="modal-footer">
                 <button class="btn btn-secondary" onclick="hideAccountForwardingLogs()">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 新版本提示模态框 -->
+    <div class="modal" id="releaseNoticeModal"
+        onmousedown="if(event.target === this) dismissReleaseNotice()">
+        <div class="modal-content release-notice-modal-content">
+            <div class="modal-header">
+                <div>
+                    <div class="release-notice-eyebrow">版本更新</div>
+                    <h3>发现新版本</h3>
+                </div>
+                <button class="modal-close" onclick="dismissReleaseNotice()">&times;</button>
+            </div>
+            <div class="modal-body release-notice-body">
+                <div class="release-notice-version" id="releaseNoticeVersionSummary">当前版本：v{{ app_version }}</div>
+                <div class="release-notice-list" id="releaseNoticeNotesList">
+                    <div class="release-notice-card release-notice-entry" id="releaseNoticeNotesCard">
+                        <div class="release-notice-entry-header">
+                            <div class="release-notice-card-title" id="releaseNoticeNotesTitle">更新内容</div>
+                            <span class="release-notice-badge">最新</span>
+                        </div>
+                        <ul>
+                            <li>暂时无法获取更新内容，可查看完整更新日志。</li>
+                        </ul>
+                    </div>
+                </div>
+                <div class="release-notice-hint" id="releaseNoticeHint">
+                    此提示每个新版本只会显示一次。
+                </div>
+                <div class="release-notice-hint" id="releaseNoticeDockerHint" hidden>
+                    仅 Docker 版本支持在线更新，请参考
+                    <a href="https://github.com/assast/outlookEmail#readme" target="_blank" rel="noreferrer">README 中的「启用界面 Docker 在线更新」</a>
+                    进行设置。
+                </div>
+            </div>
+            <div class="modal-footer">
+                <a class="btn btn-secondary" id="releaseNoticeChangelogLink" href="{{ changelog_url }}" target="_blank" rel="noreferrer">查看更新日志</a>
+                <a class="btn btn-primary" id="releaseNoticeUpdateLink" href="{{ changelog_url }}" target="_blank" rel="noreferrer" onclick="markCurrentReleaseNoticeSeen()">前往下载</a>
+                <button class="btn btn-primary" id="releaseNoticeDockerUpdateBtn" type="button"
+                    data-default-label="Docker 在线更新" data-unavailable-label="不可在线更新"
+                    onclick="startDockerUpdate()" hidden>Docker 在线更新</button>
+                <button class="btn btn-secondary" type="button" onclick="dismissReleaseNotice()">我知道了</button>
             </div>
         </div>
     </div>

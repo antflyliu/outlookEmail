@@ -27,7 +27,6 @@ from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from email.header import decode_header
-from email.utils import parsedate_to_datetime
 from typing import Optional, List, Dict, Any
 from urllib.parse import quote, urlparse, unquote
 from zoneinfo import ZoneInfo
@@ -38,6 +37,7 @@ from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 from outlook_web.runtime import default_database_path, resource_path, resolve_secret_key, runtime_root
+from outlook_web.mail_datetime import parse_mail_datetime
 
 # 尝试导入 Flask-WTF CSRF 保护
 try:
@@ -155,6 +155,10 @@ RAW_VERSION_URL = os.getenv(
     'RAW_VERSION_URL',
     f'https://raw.githubusercontent.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}/main/VERSION',
 )
+RAW_CHANGELOG_URL = os.getenv(
+    'RAW_CHANGELOG_URL',
+    f'https://raw.githubusercontent.com/{REPOSITORY_OWNER}/{REPOSITORY_NAME}/main/CHANGELOG.md',
+)
 VERSION_CHECK_TIMEOUT = max(2, int(os.getenv('VERSION_CHECK_TIMEOUT', '5')))
 VERSION_CHECK_CACHE_TTL = max(60, int(os.getenv('VERSION_CHECK_CACHE_TTL', '900')))
 VERSION_CHECK_CACHE_LOCK = threading.Lock()
@@ -212,9 +216,139 @@ def _safe_response_json(response: requests.Response) -> Dict[str, Any]:
     return {}
 
 
+def _clean_release_note_line(line: str) -> str:
+    text = re.sub(r'^\s*(?:[-*+]|\d+\.)\s+', '', str(line or '').strip())
+    text = re.sub(r'\[([^\]]+)\]\([^)]+\)', r'\1', text)
+    text = re.sub(r'[`*_]+', '', text)
+    return text.strip()
+
+
+def _extract_release_note_items(markdown_text: str, version: str = '') -> List[str]:
+    normalized_version = normalize_version_label(version)
+    plain_version = normalized_version.lstrip('v')
+    lines = str(markdown_text or '').splitlines()
+    selected_lines = lines
+
+    if plain_version:
+        heading_pattern = re.compile(
+            rf'^##+\s+(?:\[\s*v?{re.escape(plain_version)}\s*\]|v?{re.escape(plain_version)})(?:\s|$)',
+            flags=re.IGNORECASE,
+        )
+        start_index = None
+        for index, line in enumerate(lines):
+            if heading_pattern.search(line.strip()):
+                start_index = index + 1
+                break
+        if start_index is not None:
+            end_index = len(lines)
+            for index in range(start_index, len(lines)):
+                if re.match(r'^##\s+', lines[index].strip()):
+                    end_index = index
+                    break
+            selected_lines = lines[start_index:end_index]
+
+    items: List[str] = []
+    for line in selected_lines:
+        if not re.match(r'^\s*(?:[-*+]|\d+\.)\s+', line):
+            continue
+        item = _clean_release_note_line(line)
+        if item:
+            items.append(item)
+        if len(items) >= 8:
+            break
+
+    return items
+
+
+def _release_note_entry(title: str, items: List[str], url: str = '') -> Dict[str, Any]:
+    return {
+        'title': title,
+        'items': items,
+        'url': url,
+    }
+
+
+def _extract_changelog_release_entries(markdown_text: str, limit: int = 3) -> List[Dict[str, Any]]:
+    lines = str(markdown_text or '').splitlines()
+    headings: List[tuple[int, str, str]] = []
+    heading_pattern = re.compile(r'^##\s+(?:\[\s*(v?\d+\.\d+\.\d+[^]\s]*)\s*\]|(v?\d+\.\d+\.\d+[^\s]*))', flags=re.IGNORECASE)
+
+    for index, line in enumerate(lines):
+        match = heading_pattern.match(line.strip())
+        if not match:
+            continue
+        version = normalize_version_label(match.group(1) or match.group(2) or '')
+        if version:
+            headings.append((index, version, line.strip()))
+
+    entries: List[Dict[str, Any]] = []
+    for heading_index, version, _heading_text in headings[:limit]:
+        end_index = len(lines)
+        for index in range(heading_index + 1, len(lines)):
+            if re.match(r'^##\s+', lines[index].strip()):
+                end_index = index
+                break
+        items = _extract_release_note_items('\n'.join(lines[heading_index + 1:end_index]))
+        if items:
+            entries.append(_release_note_entry(version, items, CHANGELOG_URL))
+
+    return entries
+
+
+def _empty_release_notes() -> Dict[str, Any]:
+    return {
+        'source': '',
+        'title': '',
+        'items': [],
+        'entries': [],
+        'url': '',
+    }
+
+
+def build_release_notes_payload(source: str, title: str, body: str, url: str, version: str) -> Dict[str, Any]:
+    items = _extract_release_note_items(body, version)
+    if not items:
+        return _empty_release_notes()
+    entry = _release_note_entry(title or version, items, url)
+    return {
+        'source': source,
+        'title': entry['title'],
+        'items': items,
+        'entries': [entry],
+        'url': url,
+    }
+
+
+def fetch_changelog_release_notes(version: str) -> Dict[str, Any]:
+    response = requests.get(
+        RAW_CHANGELOG_URL,
+        headers=_version_request_headers(),
+        timeout=VERSION_CHECK_TIMEOUT,
+    )
+    response.raise_for_status()
+    entries = _extract_changelog_release_entries(response.text, limit=3)
+    if not entries:
+        return build_release_notes_payload(
+            'changelog',
+            version,
+            response.text,
+            CHANGELOG_URL,
+            version,
+        )
+    return {
+        'source': 'changelog',
+        'title': entries[0]['title'],
+        'items': entries[0]['items'],
+        'entries': entries,
+        'url': CHANGELOG_URL,
+    }
+
+
 def fetch_remote_version_snapshot() -> Dict[str, Any]:
     release_version = ''
     release_url = ''
+    release_title = ''
+    release_body = ''
     repository_version = ''
     errors = []
 
@@ -228,6 +362,8 @@ def fetch_remote_version_snapshot() -> Dict[str, Any]:
         release_payload = _safe_response_json(release_response)
         release_version = normalize_version_label(release_payload.get('tag_name', ''))
         release_url = str(release_payload.get('html_url', '')).strip()
+        release_title = str(release_payload.get('name', '')).strip()
+        release_body = str(release_payload.get('body', '')).strip()
     except Exception as exc:
         errors.append(f'release:{exc}')
 
@@ -245,6 +381,8 @@ def fetch_remote_version_snapshot() -> Dict[str, Any]:
     return {
         'release_version': release_version,
         'release_url': release_url,
+        'release_title': release_title,
+        'release_body': release_body,
         'repository_version': repository_version,
         'errors': errors,
     }
@@ -287,6 +425,7 @@ def build_version_status_payload() -> Dict[str, Any]:
         'changelog_url': CHANGELOG_URL,
         'checked_at': datetime.now(timezone.utc).isoformat(),
         'errors': snapshot['errors'],
+        'release_notes': _empty_release_notes(),
     }
 
     if current_parts is None:
@@ -309,8 +448,21 @@ def build_version_status_payload() -> Dict[str, Any]:
         payload['badge_label'] = '可更新'
         if latest_source == 'release':
             payload['hint'] = f'发现新版本 {latest_version}'
+            payload['release_notes'] = build_release_notes_payload(
+                'release',
+                snapshot.get('release_title') or latest_version,
+                snapshot.get('release_body', ''),
+                snapshot.get('release_url') or latest_url,
+                latest_version,
+            )
         else:
             payload['hint'] = f'仓库最新版本为 {latest_version}'
+        try:
+            changelog_release_notes = fetch_changelog_release_notes(latest_version)
+            if changelog_release_notes['items']:
+                payload['release_notes'] = changelog_release_notes
+        except Exception as exc:
+            payload['errors'].append(f'changelog:{exc}')
         return payload
 
     if current_vs_release is not None and current_vs_release > 0:
@@ -951,6 +1103,27 @@ def close_connection(exception):
         db.close()
 
 
+def get_index_columns(cursor, index_name: str) -> List[str]:
+    return [
+        row[2]
+        for row in cursor.execute(f'PRAGMA index_info({index_name})').fetchall()
+        if row[2]
+    ]
+
+
+def ensure_index_columns(cursor, index_name: str, table_name: str,
+                         expected_columns: List[str], create_sql: str) -> None:
+    """仅当索引缺失或列顺序变化时重建索引，避免每次启动都 DROP/CREATE。"""
+    indexes = {
+        row[1]
+        for row in cursor.execute(f'PRAGMA index_list({table_name})').fetchall()
+    }
+    if index_name in indexes and get_index_columns(cursor, index_name) == expected_columns:
+        return
+    cursor.execute(f'DROP INDEX IF EXISTS {index_name}')
+    cursor.execute(create_sql)
+
+
 def normalize_group_sort_orders_on_startup(cursor) -> None:
     """启动时归一化分组顺序，但保留已有自定义顺序。"""
     cursor.execute(
@@ -1028,6 +1201,9 @@ def init_db():
             imap_password TEXT,
             forward_enabled INTEGER DEFAULT 0,
             forward_last_checked_at TIMESTAMP,
+            proxy_url TEXT DEFAULT '',
+            fallback_proxy_url_1 TEXT DEFAULT '',
+            fallback_proxy_url_2 TEXT DEFAULT '',
             last_refresh_at TIMESTAMP,
             last_refresh_status TEXT DEFAULT 'never',
             last_refresh_error TEXT,
@@ -1127,6 +1303,37 @@ def init_db():
             channel TEXT NOT NULL,
             created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             UNIQUE(account_id, message_id, channel),
+            FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE
+        )
+    ''')
+
+    # 创建普通邮箱本地保留邮件表（列表元数据 + 已缓存正文）
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS retained_normal_mail_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            account_id INTEGER NOT NULL,
+            folder TEXT NOT NULL DEFAULT 'inbox',
+            provider_message_id TEXT NOT NULL,
+            id_mode TEXT NOT NULL DEFAULT '',
+            subject TEXT DEFAULT '无主题',
+            sender TEXT DEFAULT '未知',
+            recipients TEXT DEFAULT '',
+            cc TEXT DEFAULT '',
+            received_at TEXT DEFAULT '',
+            received_at_sort REAL DEFAULT 0,
+            is_read INTEGER NOT NULL DEFAULT 0,
+            has_attachments INTEGER NOT NULL DEFAULT 0,
+            body_preview TEXT DEFAULT '',
+            body TEXT,
+            body_type TEXT DEFAULT 'text',
+            attachments_json TEXT DEFAULT '[]',
+            list_cached INTEGER NOT NULL DEFAULT 1,
+            body_cached INTEGER NOT NULL DEFAULT 0,
+            list_cached_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            body_cached_at TIMESTAMP,
+            last_synced_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
             FOREIGN KEY (account_id) REFERENCES accounts (id) ON DELETE CASCADE
         )
     ''')
@@ -1346,6 +1553,12 @@ def init_db():
         cursor.execute('ALTER TABLE accounts ADD COLUMN forward_enabled INTEGER DEFAULT 0')
     if 'forward_last_checked_at' not in columns:
         cursor.execute('ALTER TABLE accounts ADD COLUMN forward_last_checked_at TIMESTAMP')
+    if 'proxy_url' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN proxy_url TEXT')
+    if 'fallback_proxy_url_1' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN fallback_proxy_url_1 TEXT')
+    if 'fallback_proxy_url_2' not in columns:
+        cursor.execute('ALTER TABLE accounts ADD COLUMN fallback_proxy_url_2 TEXT')
     
     # 检查 groups 表是否有 is_system 列
     cursor.execute("PRAGMA table_info(groups)")
@@ -1376,6 +1589,11 @@ def init_db():
         cursor.execute('ALTER TABLE temp_emails ADD COLUMN cloudflare_jwt TEXT')
     if 'cloudflare_address_id' not in temp_columns:
         cursor.execute('ALTER TABLE temp_emails ADD COLUMN cloudflare_address_id TEXT')
+
+    cursor.execute("PRAGMA table_info(retained_normal_mail_messages)")
+    retained_normal_mail_columns = {row[1] for row in cursor.fetchall()}
+    if 'received_at_sort' not in retained_normal_mail_columns:
+        cursor.execute('ALTER TABLE retained_normal_mail_messages ADD COLUMN received_at_sort REAL DEFAULT 0')
 
     cursor.execute("PRAGMA table_info(project_accounts)")
     project_account_columns = [col[1] for col in cursor.fetchall()]
@@ -1559,6 +1777,10 @@ def init_db():
     cursor.execute('''
         INSERT OR IGNORE INTO settings (key, value)
         VALUES ('show_group_id', 'true')
+    ''')
+    cursor.execute('''
+        INSERT OR IGNORE INTO settings (key, value)
+        VALUES ('normal_mail_local_retention_enabled', 'false')
     ''')
 
     cursor.execute('''
@@ -1804,6 +2026,33 @@ def init_db():
     ''')
 
     cursor.execute('''
+        CREATE UNIQUE INDEX IF NOT EXISTS ux_retained_normal_mail_messages_key
+        ON retained_normal_mail_messages(account_id, folder, provider_message_id, id_mode)
+    ''')
+
+    ensure_index_columns(
+        cursor,
+        'idx_retained_normal_mail_messages_list',
+        'retained_normal_mail_messages',
+        ['account_id', 'folder', 'received_at_sort', 'id'],
+        '''
+        CREATE INDEX idx_retained_normal_mail_messages_list
+        ON retained_normal_mail_messages(account_id, folder, received_at_sort DESC, id DESC)
+        '''
+    )
+
+    ensure_index_columns(
+        cursor,
+        'idx_retained_normal_mail_messages_body_cache',
+        'retained_normal_mail_messages',
+        ['account_id', 'folder', 'body_cached', 'received_at_sort'],
+        '''
+        CREATE INDEX idx_retained_normal_mail_messages_body_cache
+        ON retained_normal_mail_messages(account_id, folder, body_cached, received_at_sort DESC)
+        '''
+    )
+
+    cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_forwarding_logs_account_created
         ON forwarding_logs(account_id, created_at)
     ''')
@@ -1823,12 +2072,45 @@ def init_db():
         ON account_aliases(alias_email)
     ''')
 
+    # 回填历史保留邮件的规范化排序时间，保持旧数据库升级后分页顺序稳定。
+    backfill_retained_normal_mail_received_at_sort(conn)
+
     # 迁移现有明文数据为加密数据
     migrate_sensitive_data(conn)
 
     conn.commit()
     conn.close()
 
+
+
+def backfill_retained_normal_mail_received_at_sort(conn) -> int:
+    """为旧保留邮件行回填可排序时间戳；事务提交由调用方负责。"""
+    cursor = conn.cursor()
+    try:
+        cursor.execute('''
+            SELECT id, received_at
+            FROM retained_normal_mail_messages
+            WHERE COALESCE(received_at_sort, 0) = 0
+              AND COALESCE(received_at, '') <> ''
+        ''')
+    except sqlite3.OperationalError:
+        return 0
+
+    updates = []
+    for row_id, received_at in cursor.fetchall():
+        parsed = parse_mail_datetime(received_at)
+        if not parsed:
+            continue
+        updates.append((parsed.timestamp(), row_id))
+
+    if not updates:
+        return 0
+
+    cursor.executemany(
+        'UPDATE retained_normal_mail_messages SET received_at_sort = ? WHERE id = ?',
+        updates
+    )
+    return len(updates)
 
 def migrate_sensitive_data(conn):
     """迁移现有明文敏感数据为加密数据"""
@@ -1912,6 +2194,10 @@ def set_setting(key: str, value: str) -> bool:
             VALUES (?, ?, CURRENT_TIMESTAMP)
         ''', (key, value))
         db.commit()
+        if key == 'normal_mail_local_retention_enabled':
+            cache_updater = globals().get('set_normal_mail_local_retention_enabled_cache')
+            if callable(cache_updater):
+                cache_updater(value)
         return True
     except Exception:
         return False
