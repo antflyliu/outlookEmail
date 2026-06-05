@@ -4,6 +4,8 @@ import os
 import pathlib
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from email.message import EmailMessage
@@ -33,6 +35,7 @@ class ProjectRuntimeTests(unittest.TestCase):
         with self.app.app_context():
             web_outlook_app.init_db()
             db = web_outlook_app.get_db()
+            db.execute('DELETE FROM group_disabled_check_tasks')
             db.execute('DELETE FROM project_account_events')
             db.execute('DELETE FROM project_accounts')
             db.execute('DELETE FROM project_group_scopes')
@@ -621,6 +624,425 @@ class ProjectRuntimeTests(unittest.TestCase):
         all_payload = all_response.get_json()
         self.assertTrue(all_payload['success'])
         self.assertEqual(all_payload['total'], 3)
+
+    def test_account_search_ui_defaults_to_current_group_scope(self):
+        layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        batch_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '10-batch-actions.js').read_text(encoding='utf-8')
+
+        self.assertIn('<option value="group" selected>当前分组</option>', layout_html)
+        self.assertIn("const migrationKey = 'outlook_account_search_scope_default_migrated';", groups_js)
+        self.assertIn("localStorage.setItem('outlook_account_search_scope', 'group');", groups_js)
+        self.assertIn("select.value = savedScope === 'all' ? 'all' : 'group';", groups_js)
+        self.assertIn("params.set('group_id', String(currentGroupId));", groups_js)
+        self.assertLess(
+            groups_js.index("q: query,"),
+            groups_js.index("params.set('group_id', String(currentGroupId));")
+        )
+        self.assertIn('async function confirmBatchMoveGroup()', batch_js)
+        move_block = batch_js[batch_js.index('async function confirmBatchMoveGroup()'):]
+        self.assertIn("fetch('/api/accounts/batch-update-group'", move_block)
+        self.assertIn('invalidateAccountCaches();', move_block)
+
+    def test_batch_update_account_status_updates_only_changed_accounts(self):
+        active_account_id = self._insert_account('status-active@example.com', status='active')
+        inactive_account_id = self._insert_account('status-inactive@example.com', status='inactive')
+        already_inactive_account_id = self._insert_account('status-already-inactive@example.com', status='inactive')
+
+        response = self.client.post('/api/accounts/batch-update-status', json={
+            'account_ids': [active_account_id, inactive_account_id, 999999],
+            'status': 'inactive',
+        })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['status'], 'inactive')
+        self.assertEqual(payload['updated_count'], 1)
+        self.assertEqual(payload['unchanged_count'], 1)
+        self.assertEqual(payload['missing_ids'], [999999])
+        self.assertEqual(
+            [account['email'] for account in payload['updated_accounts']],
+            ['status-active@example.com']
+        )
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            rows = db.execute(
+                '''
+                SELECT id, status
+                FROM accounts
+                WHERE id IN (?, ?, ?)
+                ''',
+                (active_account_id, inactive_account_id, already_inactive_account_id)
+            ).fetchall()
+            status_by_id = {row['id']: row['status'] for row in rows}
+
+        self.assertEqual(status_by_id[active_account_id], 'inactive')
+        self.assertEqual(status_by_id[inactive_account_id], 'inactive')
+        self.assertEqual(status_by_id[already_inactive_account_id], 'inactive')
+
+    def test_inactive_account_batch_ui_exposes_selection_and_status_actions(self):
+        layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        batch_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '10-batch-actions.js').read_text(encoding='utf-8')
+
+        self.assertIn('id="accountSelectInactiveBtn"', layout_html)
+        self.assertIn('onclick="selectInactiveAccounts()"', layout_html)
+        self.assertIn('id="batchActivateAccountsBtn"', layout_html)
+        self.assertIn('onclick="activateSelectedAccounts()"', layout_html)
+        self.assertIn('id="batchDeactivateAccountsBtn"', layout_html)
+        self.assertIn('onclick="deactivateSelectedAccounts()"', layout_html)
+        self.assertIn('data-account-status="${escapeHtml(acc.status || \'active\')}"', groups_js)
+        self.assertIn('function selectInactiveAccounts()', batch_js)
+        self.assertIn("fetch('/api/accounts/batch-update-status'", batch_js)
+        self.assertIn("await updateStatusForSelectedAccounts('active');", batch_js)
+        self.assertIn("await updateStatusForSelectedAccounts('inactive');", batch_js)
+
+    def test_batch_disabled_check_reports_row_results_and_summary(self):
+        disabled_account_id = self._insert_account('disabled-check-hit@example.com', status='active')
+        active_account_id = self._insert_account('disabled-check-ok@example.com', status='inactive')
+
+        def fake_scan(account, recent_count=2, proxy_url='', fallback_proxy_urls=None):
+            if account['email'] == 'disabled-check-hit@example.com':
+                return {
+                    'success': True,
+                    'status': 'disabled',
+                    'disabled': True,
+                    'checked_count': recent_count,
+                    'checked_emails': [
+                        {'folder': 'inbox', 'subject': 'OpenAI - Access Deactivated', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                    ],
+                    'matched_emails': [
+                        {'folder': 'inbox', 'subject': 'OpenAI - Access Deactivated', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                    ],
+                }
+            return {
+                'success': True,
+                'status': 'active',
+                'disabled': False,
+                'checked_count': recent_count,
+                'checked_emails': [
+                    {'folder': 'inbox', 'subject': 'Your temporary OpenAI login code', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                ],
+                'matched_emails': [],
+            }
+
+        with patch.object(web_outlook_app, 'scan_account_for_disabled_notice_with_proxy', side_effect=fake_scan) as scan_mock:
+            response = self.client.post('/api/accounts/disabled-check', json={
+                'text': '\n'.join([
+                    'disabled-check-hit@example.com',
+                    'disabled-check-ok@example.com',
+                    'missing-disabled-check@example.com',
+                    'not-an-email',
+                ]),
+                'recent_count': 2,
+            })
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['recent_count'], 2)
+        self.assertEqual(scan_mock.call_count, 2)
+
+        summary = payload['summary']
+        self.assertEqual(summary['input_count'], 4)
+        self.assertEqual(summary['valid_count'], 3)
+        self.assertEqual(summary['found_count'], 2)
+        self.assertEqual(summary['checked_count'], 2)
+        self.assertEqual(summary['disabled_count'], 1)
+        self.assertEqual(summary['active_count'], 1)
+        self.assertEqual(summary['not_found_count'], 1)
+        self.assertEqual(summary['invalid_count'], 1)
+        self.assertEqual(summary['disabled_rate'], 50.0)
+
+        rows_by_email = {row['email']: row for row in payload['results']}
+        self.assertEqual(rows_by_email['disabled-check-hit@example.com']['account_id'], disabled_account_id)
+        self.assertTrue(rows_by_email['disabled-check-hit@example.com']['disabled'])
+        self.assertEqual(rows_by_email['disabled-check-hit@example.com']['status_label'], '已停用')
+        self.assertEqual(rows_by_email['disabled-check-ok@example.com']['account_id'], active_account_id)
+        self.assertFalse(rows_by_email['disabled-check-ok@example.com']['disabled'])
+        self.assertEqual(rows_by_email['disabled-check-ok@example.com']['account_status'], 'inactive')
+        self.assertEqual(rows_by_email['missing-disabled-check@example.com']['status'], 'not_found')
+        self.assertEqual(rows_by_email['not-an-email']['status'], 'invalid')
+
+    def test_group_disabled_check_marks_detected_accounts_inactive(self):
+        group_id = self._create_group('disabled-check-group')
+        disabled_account_id = self._insert_account('group-disabled-hit@example.com', group_id=group_id, status='active')
+        already_inactive_id = self._insert_account('group-disabled-already@example.com', group_id=group_id, status='inactive')
+        active_account_id = self._insert_account('group-disabled-ok@example.com', group_id=group_id, status='active')
+        other_group_account_id = self._insert_account('group-disabled-other@example.com', status='active')
+
+        def fake_scan(account, recent_count=2, proxy_url='', fallback_proxy_urls=None):
+            disabled = account['email'] in {
+                'group-disabled-hit@example.com',
+                'group-disabled-already@example.com',
+            }
+            return {
+                'success': True,
+                'status': 'disabled' if disabled else 'active',
+                'disabled': disabled,
+                'checked_count': recent_count,
+                'checked_emails': [
+                    {'folder': 'inbox', 'subject': 'OpenAI - Access Deactivated' if disabled else 'Login code', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                ],
+                'matched_emails': [
+                    {'folder': 'inbox', 'subject': 'OpenAI - Access Deactivated', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                ] if disabled else [],
+            }
+
+        with patch.object(web_outlook_app, 'scan_account_for_disabled_notice_with_proxy', side_effect=fake_scan) as scan_mock:
+            response = self.client.post(
+                f'/api/groups/{group_id}/accounts/disabled-check',
+                json={'recent_count': 3, 'async': False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['recent_count'], 3)
+        self.assertEqual(scan_mock.call_count, 3)
+
+        summary = payload['summary']
+        self.assertEqual(summary['group_account_count'], 3)
+        self.assertEqual(summary['checked_count'], 3)
+        self.assertEqual(summary['disabled_count'], 2)
+        self.assertEqual(summary['marked_inactive_count'], 1)
+        self.assertEqual(summary['already_inactive_count'], 1)
+        self.assertEqual(payload['status_update']['updated_count'], 1)
+
+        rows_by_email = {row['email']: row for row in payload['results']}
+        self.assertTrue(rows_by_email['group-disabled-hit@example.com']['marked_inactive'])
+        self.assertEqual(rows_by_email['group-disabled-hit@example.com']['account_status_after'], 'inactive')
+        self.assertFalse(rows_by_email['group-disabled-already@example.com']['marked_inactive'])
+        self.assertEqual(rows_by_email['group-disabled-already@example.com']['account_status_after'], 'inactive')
+        self.assertFalse(rows_by_email['group-disabled-ok@example.com']['disabled'])
+
+        with self.app.app_context():
+            db = web_outlook_app.get_db()
+            status_rows = db.execute(
+                '''
+                SELECT id, status
+                FROM accounts
+                WHERE id IN (?, ?, ?, ?)
+                ''',
+                (disabled_account_id, already_inactive_id, active_account_id, other_group_account_id)
+            ).fetchall()
+            statuses = {row['id']: row['status'] for row in status_rows}
+
+        self.assertEqual(statuses[disabled_account_id], 'inactive')
+        self.assertEqual(statuses[already_inactive_id], 'inactive')
+        self.assertEqual(statuses[active_account_id], 'active')
+        self.assertEqual(statuses[other_group_account_id], 'active')
+
+    def test_group_disabled_check_scans_accounts_concurrently(self):
+        group_id = self._create_group('disabled-check-concurrent-group')
+        for index in range(4):
+            self._insert_account(f'group-disabled-concurrent-{index}@example.com', group_id=group_id, status='active')
+
+        lock = threading.Lock()
+        active_calls = 0
+        max_active_calls = 0
+
+        def fake_scan(account, recent_count=2, proxy_url='', fallback_proxy_urls=None):
+            nonlocal active_calls, max_active_calls
+            with lock:
+                active_calls += 1
+                max_active_calls = max(max_active_calls, active_calls)
+            try:
+                time.sleep(0.1)
+                return {
+                    'success': True,
+                    'status': 'active',
+                    'disabled': False,
+                    'checked_count': recent_count,
+                    'checked_emails': [
+                        {'folder': 'inbox', 'subject': 'Login code', 'from': 'noreply@example.com', 'date': '2026-05-28T00:00:00Z'}
+                    ],
+                    'matched_emails': [],
+                }
+            finally:
+                with lock:
+                    active_calls -= 1
+
+        with patch.object(web_outlook_app, 'DISABLED_GROUP_CHECK_MAX_WORKERS', 4), \
+                patch.object(web_outlook_app, 'get_account_proxy_url', side_effect=AssertionError('worker must not read account proxy from DB')), \
+                patch.object(web_outlook_app, 'scan_account_for_disabled_notice_with_proxy', side_effect=fake_scan) as scan_mock:
+            response = self.client.post(
+                f'/api/groups/{group_id}/accounts/disabled-check',
+                json={'recent_count': 2, 'async': False},
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(scan_mock.call_count, 4)
+        self.assertGreaterEqual(max_active_calls, 2)
+        self.assertEqual([row['line'] for row in payload['results']], [1, 2, 3, 4])
+
+    def test_group_disabled_check_scan_uses_preloaded_proxy_without_db_lookup(self):
+        account = {
+            'id': 123,
+            'email': 'group-disabled-proxy@example.com',
+            'account_type': 'outlook',
+            'client_id': 'client-id',
+            'refresh_token': 'refresh-token',
+            'status': 'active',
+        }
+
+        def fake_fetch(account_arg, folder, skip, top, proxy_url='', fallback_proxy_urls=None):
+            return {
+                'success': True,
+                'emails': [],
+                'method': 'fake',
+                'has_more': False,
+                'request_method': 'fake',
+            }
+
+        with patch.object(web_outlook_app, 'get_account_proxy_url', side_effect=AssertionError('scan must use preloaded proxy')), \
+                patch.object(web_outlook_app, 'fetch_account_folder_emails', side_effect=fake_fetch) as fetch_mock:
+            result = web_outlook_app.scan_account_for_disabled_notice_with_proxy(
+                account,
+                2,
+                'http://127.0.0.1:7890',
+                ['http://127.0.0.1:7891', 'http://127.0.0.1:7892'],
+            )
+
+        self.assertTrue(result['success'])
+        self.assertFalse(result['disabled'])
+        self.assertEqual(fetch_mock.call_count, 2)
+        self.assertCountEqual(
+            [call.args[1] for call in fetch_mock.call_args_list],
+            ['inbox', 'junkemail'],
+        )
+        self.assertTrue(all(call.args[4] == 'http://127.0.0.1:7890' for call in fetch_mock.call_args_list))
+
+    def test_disabled_check_defaults_to_recent_ten_emails(self):
+        self.assertEqual(web_outlook_app.DISABLED_ACCOUNT_CHECK_RECENT_COUNT, 10)
+        self.assertEqual(web_outlook_app.normalize_disabled_check_recent_count(None), 10)
+        self.assertEqual(web_outlook_app.normalize_disabled_check_recent_count(''), 10)
+        self.assertEqual(web_outlook_app.normalize_disabled_check_recent_count('20'), 10)
+
+    def test_group_disabled_check_default_endpoint_returns_background_task(self):
+        group_id = self._create_group('disabled-check-async-group')
+        self._insert_account('group-disabled-async@example.com', group_id=group_id, status='active')
+
+        fake_payload = {
+            'success': True,
+            'group': {'id': group_id, 'name': 'disabled-check-async-group'},
+            'recent_count': 2,
+            'results': [],
+            'summary': {
+                'checked_count': 0,
+                'disabled_count': 0,
+                'marked_inactive_count': 0,
+            },
+            'message': '当前分组检测完成：发现停用 0 个，本次标注 0 个',
+        }
+
+        with patch.object(web_outlook_app, 'build_group_disabled_check_payload', return_value=(fake_payload, None)):
+            response = self.client.post(
+                f'/api/groups/{group_id}/accounts/disabled-check',
+                json={'recent_count': 2},
+            )
+
+            self.assertEqual(response.status_code, 202)
+            payload = response.get_json()
+            self.assertTrue(payload['success'])
+            self.assertEqual(payload['status'], 'running')
+            self.assertTrue(payload['task_id'])
+
+            task_payload = None
+            for _ in range(20):
+                task_response = self.client.get(f"/api/groups/disabled-check-tasks/{payload['task_id']}")
+                self.assertEqual(task_response.status_code, 200)
+                task_payload = task_response.get_json()
+                if task_payload.get('task_status') == 'completed':
+                    break
+                time.sleep(0.05)
+
+        self.assertIsNotNone(task_payload)
+        self.assertEqual(task_payload['task_id'], payload['task_id'])
+        self.assertEqual(task_payload['task_status'], 'completed')
+        self.assertEqual(task_payload['summary']['marked_inactive_count'], 0)
+
+        history_response = self.client.get(f'/api/groups/disabled-check-tasks/history?group_id={group_id}')
+        self.assertEqual(history_response.status_code, 200)
+        history_payload = history_response.get_json()
+        self.assertTrue(history_payload['success'])
+        self.assertEqual(history_payload['total'], 1)
+        self.assertEqual(history_payload['tasks'][0]['task_id'], payload['task_id'])
+        self.assertEqual(history_payload['tasks'][0]['status'], 'completed')
+        self.assertEqual(history_payload['tasks'][0]['group_name'], 'disabled-check-async-group')
+
+        with web_outlook_app.DISABLED_GROUP_CHECK_TASK_LOCK:
+            web_outlook_app.DISABLED_GROUP_CHECK_TASKS.pop(payload['task_id'], None)
+        persisted_response = self.client.get(f"/api/groups/disabled-check-tasks/{payload['task_id']}")
+        self.assertEqual(persisted_response.status_code, 200)
+        persisted_payload = persisted_response.get_json()
+        self.assertEqual(persisted_payload['task_status'], 'completed')
+        self.assertEqual(persisted_payload['task_id'], payload['task_id'])
+
+    def test_batch_disabled_check_ui_exposes_upload_input_and_result_rendering(self):
+        index_html = pathlib.Path(ROOT_DIR, 'templates', 'index.html').read_text(encoding='utf-8')
+        layout_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'layout.html').read_text(encoding='utf-8')
+        dialog_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')
+        groups_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '02-groups.js').read_text(encoding='utf-8')
+        batch_js = pathlib.Path(ROOT_DIR, 'static', 'js', 'index', '10-batch-actions.js').read_text(encoding='utf-8')
+        modal_css = pathlib.Path(ROOT_DIR, 'static', 'css', 'index', '06-modals-toast.css').read_text(encoding='utf-8')
+
+        self.assertIn("static_asset_version('js/index/02-groups.js')", index_html)
+        self.assertIn("static_asset_version('js/index/10-batch-actions.js')", index_html)
+        self.assertIn('onclick="showDisabledCheckModal()"', groups_js)
+        self.assertIn('id="disabledCheckModal"', dialog_html)
+        self.assertIn('handleDisabledCheckModalMouseDown(event)', dialog_html)
+        self.assertIn('id="disabledCheckModalTitle"', dialog_html)
+        self.assertIn('id="disabledCheckFileInput"', dialog_html)
+        self.assertIn('accept=".txt,text/plain"', dialog_html)
+        self.assertIn('id="disabledCheckInput"', dialog_html)
+        self.assertIn('id="disabledCheckSummary"', dialog_html)
+        self.assertIn('id="disabledCheckResults"', dialog_html)
+        self.assertIn('<option value="10" selected>最近 10 封</option>', dialog_html)
+        self.assertIn('id="disabledCheckHistoryModal"', dialog_html)
+        self.assertIn('id="disabledCheckHistoryBtn"', dialog_html)
+        self.assertIn('id="disabledCheckHistoryList"', dialog_html)
+        self.assertIn('function handleDisabledCheckFileSelect(event)', batch_js)
+        self.assertIn('function handleDisabledCheckModalMouseDown(event)', batch_js)
+        self.assertIn('function setDisabledCheckTaskLocked(locked)', batch_js)
+        self.assertIn('async function runDisabledAccountCheck()', batch_js)
+        self.assertIn('async function runCurrentGroupDisabledCheck()', batch_js)
+        self.assertIn('async function pollCurrentGroupDisabledCheckTask(taskId)', batch_js)
+        self.assertIn('async function loadDisabledCheckHistory()', batch_js)
+        self.assertIn('function showDisabledCheckHistoryModal()', batch_js)
+        self.assertIn('async function viewDisabledCheckHistoryTask(taskId)', batch_js)
+        self.assertIn('renderDisabledCheckRunningState', batch_js)
+        self.assertIn("setDisabledCheckModalMode('group');", batch_js)
+        self.assertIn("setDisabledCheckModalMode('batch');", batch_js)
+        self.assertIn("fetch('/api/accounts/disabled-check'", batch_js)
+        self.assertIn("accounts/disabled-check", batch_js)
+        self.assertIn("disabledCheckRecentCount')?.value || '10'", batch_js)
+        self.assertIn('Number.isFinite(recentCount) ? recentCount : 10', batch_js)
+        self.assertIn('disabled-check-tasks/history', batch_js)
+        self.assertIn('function renderDisabledCheckSummary(summary)', batch_js)
+        self.assertIn('function renderDisabledCheckResults(results)', batch_js)
+        self.assertIn('marked_inactive_count', batch_js)
+        self.assertIn('disabled-check-spinner', batch_js)
+        self.assertIn('.disabled-check-loading-card', modal_css)
+        self.assertIn('.disabled-check-history-table', modal_css)
+        self.assertIn('.disabled-check-modal--locked', modal_css)
+        self.assertIn('disabled-check-page-locked', modal_css)
+        self.assertIn('.disabled-check-summary', modal_css)
+        self.assertIn('.disabled-check-table', modal_css)
+        self.assertIn('批量检测停用', groups_js)
+        self.assertIn('onclick="runCurrentGroupDisabledCheck()"', groups_js)
+        self.assertIn('onclick="showDisabledCheckHistoryModal()"', groups_js)
+        self.assertIn('检测当前分组并标注停用', groups_js)
+
+        response = self.client.get('/')
+        self.assertEqual(response.status_code, 200)
+        rendered_html = response.get_data(as_text=True)
+        self.assertIn('/static/js/index/02-groups.js?v=', rendered_html)
+        self.assertIn('/static/js/index/10-batch-actions.js?v=', rendered_html)
 
     def test_add_account_without_sort_order_uses_created_at_fallback(self):
         response = self.client.post(
@@ -1381,6 +1803,12 @@ class FrontendTimezoneBootstrapTests(unittest.TestCase):
         self.assertIn('<path d="M8 12.5V3.5"></path>', layout_html)
         self.assertIn('<path d="M4.5 7L8 3.5 11.5 7"></path>', layout_html)
         self.assertIn('.app-version-chip__upgrade-badge[hidden] {', navbar_css)
+
+    def test_index_page_disables_browser_translation_overlays(self):
+        index_html = pathlib.Path(ROOT_DIR, 'templates', 'index.html').read_text(encoding='utf-8')
+
+        self.assertIn('<html lang="zh-CN" class="notranslate" translate="no">', index_html)
+        self.assertIn('<meta name="google" content="notranslate">', index_html)
 
     def test_refresh_management_ui_uses_account_workbench_layout(self):
         settings_html = pathlib.Path(ROOT_DIR, 'templates', 'partials', 'index', 'dialogs-management.html').read_text(encoding='utf-8')

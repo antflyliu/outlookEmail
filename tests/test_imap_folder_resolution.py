@@ -709,6 +709,17 @@ class ExternalAccountsApiTests(unittest.TestCase):
         self.assertFalse(payload['success'])
         self.assertIn('API Key', payload['error'])
 
+    def test_external_disabled_check_requires_api_key(self):
+        response = self.client.post(
+            '/api/external/accounts/disabled-check',
+            json={'email': 'user@outlook.com'}
+        )
+
+        self.assertEqual(response.status_code, 401)
+        payload = response.get_json()
+        self.assertFalse(payload['success'])
+        self.assertIn('API Key', payload['error'])
+
     def test_internal_emails_requires_login(self):
         response = self.client.get('/api/emails/user@outlook.com?folder=inbox')
 
@@ -1005,6 +1016,91 @@ class ExternalAccountsApiTests(unittest.TestCase):
             moved = web_outlook_app.get_account_by_email('user@outlook.com')
         self.assertEqual(moved['group_id'], target_group_id)
 
+    def test_external_disabled_check_returns_integration_docs_and_results(self):
+        def fake_scan(account, recent_count=2):
+            return {
+                'success': True,
+                'status': 'disabled',
+                'disabled': True,
+                'checked_count': recent_count,
+                'checked_emails': [
+                    {
+                        'folder': 'inbox',
+                        'subject': 'OpenAI - Access Deactivated [C-HgCbekMTuc4z]',
+                        'from': 'trustandsafety@tm.openai.com',
+                        'date': '2026-05-28T00:00:00Z',
+                    }
+                ],
+                'matched_emails': [
+                    {
+                        'folder': 'inbox',
+                        'subject': 'OpenAI - Access Deactivated [C-HgCbekMTuc4z]',
+                        'from': 'trustandsafety@tm.openai.com',
+                        'date': '2026-05-28T00:00:00Z',
+                        'match_codes': [
+                            'openai_trust_and_safety_sender',
+                            'openai_access_deactivated_subject',
+                            'openai_banned_terms_body',
+                        ],
+                        'match_labels': [
+                            'OpenAI Trust & Safety 发件人',
+                            'OpenAI Access Deactivated 标题',
+                            '账号违反 Terms/Usage Policies 正文',
+                        ],
+                    }
+                ],
+            }
+
+        with patch.object(web_outlook_app, 'scan_account_for_disabled_notice', side_effect=fake_scan) as scan_mock:
+            response = self.client.post(
+                '/api/external/accounts/disabled-check',
+                headers={'X-API-Key': 'test-external-key'},
+                json={
+                    'email': 'user@outlook.com',
+                    'recent_count': 2,
+                },
+            )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual(payload['recent_count'], 2)
+        self.assertEqual(payload['summary']['checked_count'], 1)
+        self.assertEqual(payload['summary']['disabled_count'], 1)
+        self.assertEqual(payload['summary']['disabled_rate'], 100.0)
+        self.assertEqual(payload['results'][0]['status'], 'disabled')
+        self.assertTrue(payload['results'][0]['disabled'])
+        self.assertEqual(
+            payload['results'][0]['matched_emails'][0]['match_codes'],
+            [
+                'openai_trust_and_safety_sender',
+                'openai_access_deactivated_subject',
+                'openai_banned_terms_body',
+            ]
+        )
+        self.assertEqual(payload['documentation']['endpoint'], '/api/external/accounts/disabled-check')
+        self.assertEqual(payload['documentation']['auth']['header'], 'X-API-Key: <your-api-key>')
+        self.assertIn('detection_rules', payload['documentation'])
+        scan_mock.assert_called_once()
+
+    def test_disabled_notice_matcher_reports_sender_subject_and_body_rules(self):
+        text = '''
+        From: trustandsafety@tm.openai.com
+        Subject: OpenAI - Access Deactivated [C-HgCbekMTuc4z]
+        Your account has been banned because recent activity violated our Terms and Usage Policies.
+        '''
+
+        match_codes = web_outlook_app.get_disabled_account_notice_match_codes(text)
+
+        self.assertIn('openai_trust_and_safety_sender', match_codes)
+        self.assertIn('openai_access_deactivated_subject', match_codes)
+        self.assertIn('openai_banned_terms_body', match_codes)
+        self.assertIn('disabled_terms_notice', match_codes)
+        self.assertTrue(web_outlook_app.text_matches_disabled_account_notice(text))
+        self.assertFalse(
+            web_outlook_app.text_matches_disabled_account_notice('From: trustandsafety@tm.openai.com')
+        )
+
     def test_external_emails_supports_all_folder(self):
         expected_result = {
             'success': True,
@@ -1174,6 +1270,41 @@ class ExternalAccountsApiTests(unittest.TestCase):
 
         called_account = fetch_mock.call_args.args[0]
         self.assertEqual(called_account['email'], 'person@googlemail.com')
+
+    def test_external_emails_keyword_filter_checks_graph_body(self):
+        expected_result = {
+            'success': True,
+            'emails': [
+                {
+                    'id': 'message-with-body-code',
+                    'folder': 'inbox',
+                    'subject': 'OpenAI verification',
+                    'from': 'no-reply@example.com',
+                    'body_preview': 'Your verification message is ready.',
+                    'date': '2026-01-06T00:00:00Z',
+                },
+            ],
+            'method': 'Graph API',
+            'has_more': False,
+        }
+        detail = {
+            'body': {
+                'content': '<html><body>Your code is 123456.</body></html>',
+            },
+        }
+
+        with patch.object(web_outlook_app, 'fetch_account_emails', return_value=expected_result):
+            with patch.object(web_outlook_app, 'get_email_detail_graph', return_value=detail) as detail_mock:
+                response = self.client.get(
+                    '/api/external/emails?email=user@outlook.com&folder=inbox&top=1&keyword=code',
+                    headers={'X-API-Key': 'test-external-key'}
+                )
+
+        self.assertEqual(response.status_code, 200)
+        payload = response.get_json()
+        self.assertTrue(payload['success'])
+        self.assertEqual([item['id'] for item in payload['emails']], ['message-with-body-code'])
+        detail_mock.assert_called_once()
 
     def test_cloudflare_global_messages_lists_without_address_filter(self):
         raw_message = (
