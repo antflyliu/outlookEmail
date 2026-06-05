@@ -652,6 +652,65 @@
         </div>
     </div>
 
+    <!-- 批量停用检测模态框 -->
+    <div class="modal" id="disabledCheckModal" onmousedown="handleDisabledCheckModalMouseDown(event)">
+        <div class="modal-content disabled-check-modal-content">
+            <div class="modal-header">
+                <h3 id="disabledCheckModalTitle">批量停用检测</h3>
+                <button class="modal-close" onclick="hideDisabledCheckModal()">&times;</button>
+            </div>
+            <div class="modal-body disabled-check-modal-body">
+                <div class="disabled-check-input-grid">
+                    <div class="form-group">
+                        <label class="form-label">TXT 文件</label>
+                        <input type="file" class="form-input" id="disabledCheckFileInput" accept=".txt,text/plain"
+                            onchange="handleDisabledCheckFileSelect(event)">
+                    </div>
+                    <div class="form-group">
+                        <label class="form-label">最近邮件数</label>
+                        <select class="form-select" id="disabledCheckRecentCount">
+                            <option value="10" selected>最近 10 封</option>
+                            <option value="2">最近 2 封</option>
+                            <option value="3">最近 3 封</option>
+                            <option value="5">最近 5 封</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label class="form-label">邮箱账号</label>
+                    <textarea class="form-input disabled-check-textarea" id="disabledCheckInput"
+                        placeholder="user1@outlook.com&#10;user2@outlook.com"></textarea>
+                </div>
+                <div id="disabledCheckSummary" class="disabled-check-summary" hidden></div>
+                <div id="disabledCheckResults" class="disabled-check-results" hidden></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" id="disabledCheckHistoryBtn" onclick="showDisabledCheckHistoryModal()">任务历史</button>
+                <button class="btn btn-secondary" onclick="hideDisabledCheckModal()">关闭</button>
+                <button class="btn btn-primary" id="disabledCheckRunBtn" onclick="runDisabledAccountCheck()">检测</button>
+            </div>
+        </div>
+    </div>
+
+    <div class="modal" id="disabledCheckHistoryModal" onmousedown="if(event.target === this) hideDisabledCheckHistoryModal()">
+        <div class="modal-content disabled-check-history-modal-content">
+            <div class="modal-header">
+                <h3>停用检测任务历史</h3>
+                <button class="modal-close" onclick="hideDisabledCheckHistoryModal()">&times;</button>
+            </div>
+            <div class="modal-body disabled-check-history-modal-body">
+                <div class="disabled-check-history-toolbar">
+                    <span class="disabled-check-history-hint">展示最近的当前分组停用检测后台任务。</span>
+                    <button class="btn btn-secondary btn-sm" onclick="loadDisabledCheckHistory()">刷新</button>
+                </div>
+                <div id="disabledCheckHistoryList" class="disabled-check-history-list"></div>
+            </div>
+            <div class="modal-footer">
+                <button class="btn btn-secondary" onclick="hideDisabledCheckHistoryModal()">关闭</button>
+            </div>
+        </div>
+    </div>
+
     <!-- 标签管理模态框 -->
     <div class="modal" id="tagManagementModal" onmousedown="if(event.target === this) hideTagManagementModal()">
         <div class="modal-content">

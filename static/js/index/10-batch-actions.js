@@ -6,6 +6,7 @@
         let accountSelectionAnchorId = null;
         let accountSelectionDragState = null;
         let accountSelectionSuppressClickUntil = 0;
+        let disabledCheckTaskLocked = false;
 
         function getAccountSelectionCheckboxes() {
             return Array.from(document.querySelectorAll('#accountList .account-select-checkbox'));
@@ -216,7 +217,10 @@
             const bar = document.getElementById('batchActionBar');
             const countSpan = document.getElementById('selectedCount');
             const selectAllBtn = document.getElementById('accountSelectAllBtn');
+            const selectInactiveBtn = document.getElementById('accountSelectInactiveBtn');
             const batchRefreshBtn = document.getElementById('batchRefreshTokensBtn');
+            const batchActivateBtn = document.getElementById('batchActivateAccountsBtn');
+            const batchDeactivateBtn = document.getElementById('batchDeactivateAccountsBtn');
             const batchCopyBtn = document.getElementById('batchCopyEmailsBtn');
             const batchEnableForwardingBtn = document.getElementById('batchEnableForwardingBtn');
             const batchDisableForwardingBtn = document.getElementById('batchDisableForwardingBtn');
@@ -226,8 +230,13 @@
             const batchDeleteBtn = document.getElementById('batchDeleteAccountsBtn');
             const panel = document.getElementById('accountPanel');
             const refreshableChecked = checked.filter(cb => cb.dataset.refreshable === 'true');
+            const inactiveChecked = checked.filter(cb => cb.dataset.accountStatus === 'inactive');
+            const activeChecked = checked.filter(cb => cb.dataset.accountStatus !== 'inactive');
             const enableForwardingChecked = checked.filter(cb => cb.dataset.forwardEnabled !== 'true');
             const disableForwardingChecked = checked.filter(cb => cb.dataset.forwardEnabled === 'true');
+            const inactiveLoaded = Array.from(allCheckboxes).filter(cb => cb.dataset.accountStatus === 'inactive');
+            const isStatusUpdating = batchActivateBtn?.dataset.loading === 'true'
+                || batchDeactivateBtn?.dataset.loading === 'true';
             const isForwardingUpdating = batchEnableForwardingBtn?.dataset.loading === 'true'
                 || batchDisableForwardingBtn?.dataset.loading === 'true';
             const isTempContext = !!isTempEmailGroup;
@@ -239,6 +248,9 @@
                 : '';
 
             if (batchRefreshBtn) batchRefreshBtn.style.display = isTempContext ? 'none' : 'inline-flex';
+            if (selectInactiveBtn) selectInactiveBtn.style.display = isTempContext ? 'none' : 'inline-flex';
+            if (batchActivateBtn) batchActivateBtn.style.display = isTempContext ? 'none' : 'inline-flex';
+            if (batchDeactivateBtn) batchDeactivateBtn.style.display = isTempContext ? 'none' : 'inline-flex';
             if (batchEnableForwardingBtn) batchEnableForwardingBtn.style.display = isTempContext ? 'none' : 'inline-flex';
             if (batchDisableForwardingBtn) batchDisableForwardingBtn.style.display = isTempContext ? 'none' : 'inline-flex';
             if (batchMoveGroupBtn) batchMoveGroupBtn.style.display = isTempContext ? 'none' : 'inline-flex';
@@ -251,6 +263,15 @@
                 selectAllBtn.textContent = allLoadedChecked
                     ? `取消全选${scopeLabel}`
                     : `全选${scopeLabel}`;
+            }
+            if (selectInactiveBtn) {
+                selectInactiveBtn.disabled = !isTempContext && inactiveLoaded.length === 0;
+                selectInactiveBtn.textContent = inactiveLoaded.length > 0
+                    ? `选择停用 (${inactiveLoaded.length})`
+                    : '选择停用';
+                selectInactiveBtn.title = inactiveLoaded.length > 0
+                    ? '选择当前已加载列表中的停用账号'
+                    : '当前已加载列表中没有停用账号';
             }
 
             if (checked.length > 0) {
@@ -271,6 +292,28 @@
                         batchRefreshBtn.textContent = refreshableChecked.length > 0
                             ? `刷新 Token${refreshableChecked.length !== checked.length ? ` (${refreshableChecked.length})` : ''}`
                             : '刷新 Token';
+                    }
+                }
+                if (batchActivateBtn) {
+                    batchActivateBtn.disabled = inactiveChecked.length === 0 || isStatusUpdating;
+                    batchActivateBtn.title = inactiveChecked.length === 0
+                        ? '所选账号中没有停用账号'
+                        : '';
+                    if (batchActivateBtn.dataset.loading !== 'true') {
+                        batchActivateBtn.textContent = inactiveChecked.length > 0
+                            ? `启用账号${inactiveChecked.length !== checked.length ? ` (${inactiveChecked.length})` : ''}`
+                            : '启用账号';
+                    }
+                }
+                if (batchDeactivateBtn) {
+                    batchDeactivateBtn.disabled = activeChecked.length === 0 || isStatusUpdating;
+                    batchDeactivateBtn.title = activeChecked.length === 0
+                        ? '所选账号已全部停用'
+                        : '';
+                    if (batchDeactivateBtn.dataset.loading !== 'true') {
+                        batchDeactivateBtn.textContent = activeChecked.length > 0
+                            ? `停用账号${activeChecked.length !== checked.length ? ` (${activeChecked.length})` : ''}`
+                            : '停用账号';
                     }
                 }
                 if (batchCopyBtn) {
@@ -328,6 +371,18 @@
                     batchCopyBtn.textContent = isTempContext ? '复制邮箱' : '复制邮箱+别名';
                     batchCopyBtn.title = '';
                 }
+                if (batchActivateBtn) {
+                    batchActivateBtn.disabled = false;
+                    batchActivateBtn.dataset.loading = 'false';
+                    batchActivateBtn.textContent = '启用账号';
+                    batchActivateBtn.title = '';
+                }
+                if (batchDeactivateBtn) {
+                    batchDeactivateBtn.disabled = false;
+                    batchDeactivateBtn.dataset.loading = 'false';
+                    batchDeactivateBtn.textContent = '停用账号';
+                    batchDeactivateBtn.title = '';
+                }
                 if (batchEnableForwardingBtn) {
                     batchEnableForwardingBtn.disabled = false;
                     batchEnableForwardingBtn.dataset.loading = 'false';
@@ -357,6 +412,24 @@
                 cb.checked = !shouldClear;
             });
             updateBatchActionBar();
+        }
+
+        function selectInactiveAccounts() {
+            const checkboxes = Array.from(document.querySelectorAll('#accountList .account-select-checkbox'));
+            if (!checkboxes.length || isTempEmailGroup) return;
+
+            const inactiveCheckboxes = checkboxes.filter(cb => cb.dataset.accountStatus === 'inactive');
+            if (!inactiveCheckboxes.length) {
+                showToast('当前已加载列表中没有停用账号', 'error');
+                return;
+            }
+
+            checkboxes.forEach(cb => {
+                cb.checked = cb.dataset.accountStatus === 'inactive';
+            });
+            setAccountSelectionMode(true);
+            updateBatchActionBar();
+            showToast(`已选择 ${inactiveCheckboxes.length} 个停用账号`, 'success');
         }
 
         function clearAccountSelection() {
@@ -479,6 +552,82 @@
             }
         }
 
+        async function updateStatusForSelectedAccounts(targetStatus) {
+            const normalizedStatus = targetStatus === 'inactive' ? 'inactive' : 'active';
+            const btn = document.getElementById(
+                normalizedStatus === 'active' ? 'batchActivateAccountsBtn' : 'batchDeactivateAccountsBtn'
+            );
+            if (!btn || btn.disabled) return;
+
+            const checked = Array.from(document.querySelectorAll('#accountList .account-select-checkbox:checked'));
+            const eligible = checked.filter(cb => {
+                const currentStatus = cb.dataset.accountStatus === 'inactive' ? 'inactive' : 'active';
+                return currentStatus !== normalizedStatus;
+            });
+            const accountIds = eligible
+                .map(cb => parseInt(cb.value, 10))
+                .filter(Number.isFinite);
+            const actionLabel = normalizedStatus === 'active' ? '启用' : '停用';
+            const loadingLabel = normalizedStatus === 'active' ? '启用中...' : '停用中...';
+
+            if (!checked.length) {
+                showToast(`请先选择要${actionLabel}的邮箱`, 'error');
+                return;
+            }
+            if (!accountIds.length) {
+                showToast(`所选账号已全部处于${actionLabel}状态`, 'error');
+                return;
+            }
+
+            const skippedCount = checked.length - accountIds.length;
+            const confirmMessage = skippedCount > 0
+                ? `确定要${actionLabel}所选账号吗？其中 ${skippedCount} 个账号已处于目标状态，会自动跳过。`
+                : `确定要${actionLabel}所选 ${accountIds.length} 个账号吗？`;
+            if (!(await showConfirmModal(confirmMessage, { title: `批量${actionLabel}账号`, confirmText: `确认${actionLabel}`, danger: normalizedStatus === 'inactive' }))) {
+                return;
+            }
+
+            btn.disabled = true;
+            btn.dataset.loading = 'true';
+            btn.textContent = loadingLabel;
+
+            try {
+                const response = await fetch('/api/accounts/batch-update-status', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        account_ids: accountIds,
+                        status: normalizedStatus
+                    })
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    handleApiError(data, `批量${actionLabel}账号失败`);
+                    return;
+                }
+
+                showToast(data.message || `已${actionLabel} ${data.updated_count || accountIds.length} 个账号`, 'success');
+                invalidateAccountCaches();
+                clearAccountSelection();
+                loadGroups();
+                await refreshVisibleAccountList(true);
+            } catch (error) {
+                showToast(`批量${actionLabel}账号失败`, 'error');
+            } finally {
+                btn.dataset.loading = 'false';
+                updateBatchActionBar();
+            }
+        }
+
+        async function activateSelectedAccounts() {
+            await updateStatusForSelectedAccounts('active');
+        }
+
+        async function deactivateSelectedAccounts() {
+            await updateStatusForSelectedAccounts('inactive');
+        }
+
         async function updateForwardingForSelectedAccounts(targetEnabled) {
             const btn = document.getElementById(targetEnabled ? 'batchEnableForwardingBtn' : 'batchDisableForwardingBtn');
             if (!btn || btn.disabled) return;
@@ -548,6 +697,488 @@
 
         async function disableForwardingForSelectedAccounts() {
             await updateForwardingForSelectedAccounts(false);
+        }
+
+        function resetDisabledCheckResults() {
+            const summaryEl = document.getElementById('disabledCheckSummary');
+            const resultsEl = document.getElementById('disabledCheckResults');
+            if (summaryEl) {
+                summaryEl.hidden = true;
+                summaryEl.innerHTML = '';
+            }
+            if (resultsEl) {
+                resultsEl.hidden = true;
+                resultsEl.innerHTML = '';
+            }
+        }
+
+        function setDisabledCheckTaskLocked(locked) {
+            disabledCheckTaskLocked = !!locked;
+            document.body?.classList.toggle('disabled-check-page-locked', disabledCheckTaskLocked);
+            document.getElementById('disabledCheckModal')?.classList.toggle('disabled-check-modal--locked', disabledCheckTaskLocked);
+            const historyBtn = document.getElementById('disabledCheckHistoryBtn');
+            const recentCount = document.getElementById('disabledCheckRecentCount');
+            if (historyBtn) historyBtn.disabled = disabledCheckTaskLocked;
+            if (recentCount) recentCount.disabled = disabledCheckTaskLocked;
+        }
+
+        function handleDisabledCheckModalMouseDown(event) {
+            if (event?.target !== event?.currentTarget) return;
+            if (disabledCheckTaskLocked) return;
+            hideDisabledCheckModal();
+        }
+
+        function setDisabledCheckModalMode(mode = 'batch') {
+            const isGroupMode = mode === 'group';
+            const titleEl = document.getElementById('disabledCheckModalTitle');
+            const fileGroup = document.getElementById('disabledCheckFileInput')?.closest('.form-group');
+            const inputGroup = document.getElementById('disabledCheckInput')?.closest('.form-group');
+            const runBtn = document.getElementById('disabledCheckRunBtn');
+
+            if (titleEl) {
+                titleEl.textContent = isGroupMode ? '当前分组停用检测' : '批量停用检测';
+            }
+            if (fileGroup) {
+                fileGroup.hidden = isGroupMode;
+            }
+            if (inputGroup) {
+                inputGroup.hidden = isGroupMode;
+            }
+            if (runBtn) {
+                runBtn.hidden = isGroupMode;
+            }
+        }
+
+        function showDisabledCheckModal() {
+            setDisabledCheckTaskLocked(false);
+            setDisabledCheckModalMode('batch');
+            showModal('disabledCheckModal');
+            resetDisabledCheckResults();
+            document.getElementById('disabledCheckInput')?.focus();
+        }
+
+        function hideDisabledCheckModal() {
+            setDisabledCheckTaskLocked(false);
+            hideModal('disabledCheckModal');
+        }
+
+        function getDisabledCheckInputLines() {
+            const text = document.getElementById('disabledCheckInput')?.value || '';
+            return text
+                .split(/\r?\n/)
+                .map(line => line.trim())
+                .filter(Boolean);
+        }
+
+        function setDisabledCheckInputLines(lines) {
+            const input = document.getElementById('disabledCheckInput');
+            if (!input) return;
+            const normalizedLines = Array.from(new Set(
+                (lines || []).map(line => String(line || '').trim()).filter(Boolean)
+            ));
+            input.value = normalizedLines.join('\n');
+        }
+
+        function handleDisabledCheckFileSelect(event) {
+            const file = event?.target?.files?.[0];
+            if (!file) return;
+            if (!/\.txt$/i.test(file.name) && file.type && file.type !== 'text/plain') {
+                showToast('请选择 TXT 文档文件', 'error');
+                event.target.value = '';
+                return;
+            }
+
+            const reader = new FileReader();
+            reader.onload = () => {
+                const currentLines = getDisabledCheckInputLines();
+                const fileLines = String(reader.result || '')
+                    .split(/\r?\n/)
+                    .map(line => line.trim())
+                    .filter(Boolean);
+                setDisabledCheckInputLines(currentLines.concat(fileLines));
+                resetDisabledCheckResults();
+                showToast(`已载入 ${fileLines.length} 行邮箱`, 'success');
+            };
+            reader.onerror = () => {
+                showToast('读取 TXT 文件失败', 'error');
+            };
+            reader.readAsText(file, 'utf-8');
+        }
+
+        function formatDisabledCheckRate(value) {
+            const numberValue = Number(value);
+            if (!Number.isFinite(numberValue)) {
+                return '0%';
+            }
+            return `${numberValue.toFixed(numberValue % 1 === 0 ? 0 : 2)}%`;
+        }
+
+        function renderDisabledCheckSummary(summary) {
+            const summaryEl = document.getElementById('disabledCheckSummary');
+            if (!summaryEl) return;
+            const safeSummary = summary || {};
+            summaryEl.innerHTML = `
+                <div class="disabled-check-summary-card">
+                    <div class="disabled-check-summary-card__label">输入账号</div>
+                    <div class="disabled-check-summary-card__value">${Number(safeSummary.input_count || 0)}</div>
+                </div>
+                <div class="disabled-check-summary-card">
+                    <div class="disabled-check-summary-card__label">已检测</div>
+                    <div class="disabled-check-summary-card__value">${Number(safeSummary.checked_count || 0)}</div>
+                </div>
+                <div class="disabled-check-summary-card">
+                    <div class="disabled-check-summary-card__label">停用账号</div>
+                    <div class="disabled-check-summary-card__value danger">${Number(safeSummary.disabled_count || 0)}</div>
+                </div>
+                <div class="disabled-check-summary-card">
+                    <div class="disabled-check-summary-card__label">停用占比</div>
+                    <div class="disabled-check-summary-card__value danger">${formatDisabledCheckRate(safeSummary.disabled_rate || 0)}</div>
+                </div>
+                <div class="disabled-check-summary-card">
+                    <div class="disabled-check-summary-card__label">本次标注</div>
+                    <div class="disabled-check-summary-card__value danger">${Number(safeSummary.marked_inactive_count || 0)}</div>
+                </div>
+            `;
+            summaryEl.hidden = false;
+        }
+
+        function renderDisabledCheckRunningState(message = '当前分组停用检测仍在执行，请稍候...') {
+            const summaryEl = document.getElementById('disabledCheckSummary');
+            const resultsEl = document.getElementById('disabledCheckResults');
+            if (summaryEl) {
+                summaryEl.innerHTML = `
+                    <div class="disabled-check-loading-card">
+                        <div class="disabled-check-spinner" aria-hidden="true"></div>
+                        <div class="disabled-check-loading-text">
+                            <strong>${escapeHtml(message)}</strong>
+                            <span>正在并发登录账号并读取最近邮件，完成后会自动刷新结果。</span>
+                        </div>
+                    </div>
+                `;
+                summaryEl.hidden = false;
+            }
+            if (resultsEl) {
+                resultsEl.hidden = true;
+                resultsEl.innerHTML = '';
+            }
+        }
+
+        function getDisabledCheckSubjects(row) {
+            const matched = Array.isArray(row.matched_emails) ? row.matched_emails : [];
+            const checked = Array.isArray(row.checked_emails) ? row.checked_emails : [];
+            const source = matched.length ? matched : checked;
+            if (!source.length) {
+                return row.error || '-';
+            }
+            return source
+                .map(item => {
+                    const folder = item.folder ? `[${item.folder}] ` : '';
+                    return `${folder}${item.subject || '无主题'}`;
+                })
+                .join('\n');
+        }
+
+        function renderDisabledCheckResults(results) {
+            const resultsEl = document.getElementById('disabledCheckResults');
+            if (!resultsEl) return;
+            const rows = Array.isArray(results) ? results : [];
+            if (!rows.length) {
+                resultsEl.hidden = true;
+                resultsEl.innerHTML = '';
+                return;
+            }
+
+            resultsEl.innerHTML = `
+                <table class="disabled-check-table">
+                    <thead>
+                        <tr>
+                            <th>行</th>
+                            <th>邮箱账号</th>
+                            <th>结果</th>
+                            <th>系统状态</th>
+                            <th>标注</th>
+                            <th>检查邮件</th>
+                            <th>命中/最近主题</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rows.map(row => `
+                            <tr>
+                                <td>${escapeHtml(String(row.line || ''))}</td>
+                                <td class="disabled-check-email-cell">${escapeHtml(row.email || '')}</td>
+                                <td><span class="disabled-check-status ${escapeHtml(row.status || '')}">${escapeHtml(row.status_label || row.status || '-')}</span></td>
+                                <td>${escapeHtml(row.account_status_after || row.account_status || '-')}</td>
+                                <td>${row.marked_inactive ? '<span class="disabled-check-status disabled">已标注</span>' : '-'}</td>
+                                <td>${Number(row.checked_count || 0)}</td>
+                                <td class="disabled-check-subjects">${escapeHtml(getDisabledCheckSubjects(row))}</td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+            resultsEl.hidden = false;
+        }
+
+        async function runDisabledAccountCheck() {
+            const btn = document.getElementById('disabledCheckRunBtn');
+            if (!btn || btn.disabled) return;
+
+            const emails = getDisabledCheckInputLines();
+            if (!emails.length) {
+                showToast('请输入或上传要检测的邮箱账号', 'error');
+                return;
+            }
+
+            const recentCount = parseInt(document.getElementById('disabledCheckRecentCount')?.value || '10', 10);
+            btn.disabled = true;
+            btn.textContent = '检测中...';
+            resetDisabledCheckResults();
+
+            try {
+                const response = await fetch('/api/accounts/disabled-check', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        emails,
+                        recent_count: Number.isFinite(recentCount) ? recentCount : 10
+                    })
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    handleApiError(data, '批量停用检测失败');
+                    return;
+                }
+
+                renderDisabledCheckSummary(data.summary);
+                renderDisabledCheckResults(data.results);
+                showToast(
+                    `检测完成：停用 ${data.summary?.disabled_count || 0} / 已检测 ${data.summary?.checked_count || 0}`,
+                    data.summary?.disabled_count > 0 ? 'warning' : 'success'
+                );
+            } catch (error) {
+                showToast('批量停用检测失败', 'error');
+            } finally {
+                btn.disabled = false;
+                btn.textContent = '检测';
+            }
+        }
+
+        async function runCurrentGroupDisabledCheck() {
+            const btn = document.getElementById('groupDisabledCheckBtn');
+            if (!currentGroupId || isTempEmailGroup) {
+                showToast('请选择普通邮箱分组', 'error');
+                return;
+            }
+            if (btn?.disabled) return;
+
+            const recentCount = parseInt(document.getElementById('disabledCheckRecentCount')?.value || '10', 10);
+            if (btn) {
+                btn.disabled = true;
+                btn.dataset.loading = 'true';
+            }
+            setDisabledCheckModalMode('group');
+            showModal('disabledCheckModal');
+            setDisabledCheckTaskLocked(true);
+            resetDisabledCheckResults();
+            renderDisabledCheckRunningState('当前分组停用检测任务启动中...');
+
+            try {
+                const response = await fetch(`/api/groups/${encodeURIComponent(currentGroupId)}/accounts/disabled-check`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        recent_count: Number.isFinite(recentCount) ? recentCount : 10
+                    })
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    handleApiError(data, '当前分组停用检测失败');
+                    return;
+                }
+                if (response.status === 202 || data.status === 'running') {
+                    renderDisabledCheckRunningState(data.message || '当前分组停用检测正在后台执行...');
+                    await pollCurrentGroupDisabledCheckTask(data.task_id);
+                    return;
+                }
+
+                renderDisabledCheckSummary(data.summary);
+                renderDisabledCheckResults(data.results);
+                invalidateAccountCaches();
+                await refreshVisibleAccountList(true);
+                showToast(
+                    data.message || `当前分组检测完成：本次标注 ${data.summary?.marked_inactive_count || 0} 个`,
+                    data.summary?.disabled_count > 0 ? 'warning' : 'success'
+                );
+            } catch (error) {
+                showToast('当前分组停用检测失败', 'error');
+            } finally {
+                setDisabledCheckTaskLocked(false);
+                if (btn) {
+                    btn.disabled = false;
+                    btn.dataset.loading = 'false';
+                }
+            }
+        }
+
+        async function pollCurrentGroupDisabledCheckTask(taskId) {
+            if (!taskId) {
+                showToast('当前分组停用检测任务缺少任务 ID', 'error');
+                return;
+            }
+
+            const maxAttempts = 240;
+            for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
+                await new Promise(resolve => setTimeout(resolve, 1000));
+                renderDisabledCheckRunningState(`当前分组停用检测执行中... ${attempt}s`);
+
+                const response = await fetch(`/api/groups/disabled-check-tasks/${encodeURIComponent(taskId)}`, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+                const data = await response.json();
+
+                if (!data.success) {
+                    handleApiError(data, '当前分组停用检测失败');
+                    return;
+                }
+                if (data.task_status === 'running' || data.status === 'running') {
+                    continue;
+                }
+
+                renderDisabledCheckSummary(data.summary);
+                renderDisabledCheckResults(data.results);
+                invalidateAccountCaches();
+                await refreshVisibleAccountList(true);
+                showToast(
+                    data.message || `当前分组检测完成：本次标注 ${data.summary?.marked_inactive_count || 0} 个`,
+                    data.summary?.disabled_count > 0 ? 'warning' : 'success'
+                );
+                return;
+            }
+
+            showToast('当前分组停用检测仍在执行，请稍后刷新结果', 'warning');
+        }
+
+        function formatDisabledCheckTaskTime(value) {
+            if (!value) return '-';
+            const date = new Date(value);
+            if (Number.isNaN(date.getTime())) {
+                return String(value);
+            }
+            return date.toLocaleString();
+        }
+
+        function getDisabledCheckTaskStatusLabel(status) {
+            const normalized = String(status || '').toLowerCase();
+            if (normalized === 'completed') return '已完成';
+            if (normalized === 'failed') return '失败';
+            if (normalized === 'running') return '执行中';
+            return normalized || '-';
+        }
+
+        function renderDisabledCheckHistory(tasks) {
+            const listEl = document.getElementById('disabledCheckHistoryList');
+            if (!listEl) return;
+            const rows = Array.isArray(tasks) ? tasks : [];
+            if (!rows.length) {
+                listEl.innerHTML = '<div class="disabled-check-history-empty">暂无停用检测任务历史</div>';
+                return;
+            }
+
+            listEl.innerHTML = `
+                <table class="disabled-check-history-table">
+                    <thead>
+                        <tr>
+                            <th>时间</th>
+                            <th>分组</th>
+                            <th>状态</th>
+                            <th>已检测</th>
+                            <th>停用</th>
+                            <th>已标注</th>
+                            <th>操作</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        ${rows.map(task => `
+                            <tr>
+                                <td>${escapeHtml(formatDisabledCheckTaskTime(task.created_at))}</td>
+                                <td>${escapeHtml(task.group_name || `分组 ${task.group_id || '-'}`)}</td>
+                                <td><span class="disabled-check-status ${escapeHtml(task.status || '')}">${escapeHtml(getDisabledCheckTaskStatusLabel(task.status || task.task_status))}</span></td>
+                                <td>${Number(task.checked_count || task.summary?.checked_count || 0)}</td>
+                                <td>${Number(task.disabled_count || task.summary?.disabled_count || 0)}</td>
+                                <td>${Number(task.marked_inactive_count || task.summary?.marked_inactive_count || 0)}</td>
+                                <td>
+                                    <button class="btn btn-secondary btn-sm" onclick="viewDisabledCheckHistoryTask('${escapeHtml(task.task_id || '')}')">查看</button>
+                                </td>
+                            </tr>
+                        `).join('')}
+                    </tbody>
+                </table>
+            `;
+        }
+
+        async function loadDisabledCheckHistory() {
+            const listEl = document.getElementById('disabledCheckHistoryList');
+            if (listEl) {
+                listEl.innerHTML = '<div class="disabled-check-history-empty">正在加载任务历史...</div>';
+            }
+            const params = new URLSearchParams({ limit: '50' });
+            if (currentGroupId && !isTempEmailGroup) {
+                params.set('group_id', String(currentGroupId));
+            }
+            try {
+                const response = await fetch(`/api/groups/disabled-check-tasks/history?${params.toString()}`, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, '加载停用检测任务历史失败');
+                    return;
+                }
+                renderDisabledCheckHistory(data.tasks);
+            } catch (error) {
+                showToast('加载停用检测任务历史失败', 'error');
+            }
+        }
+
+        function showDisabledCheckHistoryModal() {
+            showModal('disabledCheckHistoryModal');
+            loadDisabledCheckHistory();
+        }
+
+        function hideDisabledCheckHistoryModal() {
+            hideModal('disabledCheckHistoryModal');
+        }
+
+        async function viewDisabledCheckHistoryTask(taskId) {
+            if (!taskId) return;
+            try {
+                const response = await fetch(`/api/groups/disabled-check-tasks/${encodeURIComponent(taskId)}`, {
+                    method: 'GET',
+                    cache: 'no-store'
+                });
+                const data = await response.json();
+                if (!data.success) {
+                    handleApiError(data, '加载停用检测任务详情失败');
+                    return;
+                }
+                hideDisabledCheckHistoryModal();
+                setDisabledCheckTaskLocked(false);
+                setDisabledCheckModalMode('group');
+                showModal('disabledCheckModal');
+                resetDisabledCheckResults();
+                if (data.task_status === 'running' || data.status === 'running') {
+                    renderDisabledCheckRunningState(data.message || '当前分组停用检测仍在执行');
+                    return;
+                }
+                renderDisabledCheckSummary(data.summary);
+                renderDisabledCheckResults(data.results);
+            } catch (error) {
+                showToast('加载停用检测任务详情失败', 'error');
+            }
         }
 
         async function deleteSelectedAccounts() {
@@ -761,9 +1392,7 @@
                     hideBatchMoveGroupModal();
                     // 刷新分组列表
                     loadGroups();
-                    if (currentGroupId) {
-                        delete accountsCache[currentGroupId];
-                    }
+                    invalidateAccountCaches();
                     await refreshVisibleAccountList(true);
                     // 清除选择
                     document.querySelectorAll('.account-select-checkbox').forEach(cb => cb.checked = false);
