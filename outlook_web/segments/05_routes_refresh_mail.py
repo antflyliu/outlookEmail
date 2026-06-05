@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed, wait
 import secrets
 import threading
 import time
@@ -2303,9 +2303,8 @@ def fetch_account_folder_emails(account: Dict[str, Any], folder: str, skip: int,
     }
 
 
-def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: int) -> Dict[str, Any]:
-    proxy_url = get_account_proxy_url(account)
-    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+def fetch_account_emails_with_proxy(account: Dict[str, Any], folder: str, skip: int, top: int,
+                                    proxy_url: str = '', fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
     folder_name = normalize_folder_name(folder)
     if folder_name not in VALID_MAIL_FOLDERS:
         return {
@@ -2370,6 +2369,1093 @@ def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: i
         )
 
     return fetch_account_folder_emails(account, folder_name, skip, top, proxy_url, fallback_proxy_urls)
+
+
+def fetch_account_emails(account: Dict[str, Any], folder: str, skip: int, top: int) -> Dict[str, Any]:
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    return fetch_account_emails_with_proxy(account, folder, skip, top, proxy_url, fallback_proxy_urls)
+
+
+DISABLED_ACCOUNT_CHECK_MAX_EMAILS = 200
+DISABLED_ACCOUNT_CHECK_RECENT_COUNT = 10
+DISABLED_ACCOUNT_CHECK_PATTERNS = [
+    re.compile(
+        r'your\s+account\s+has\s+been\s+banned\s+because\s+recent\s+activity\s+violated\s+our\s+terms\s+and\s+usage\s+policies',
+        re.IGNORECASE,
+    ),
+    re.compile(r'account\s+has\s+been\s+banned.*violat(?:ed|es|ing).*terms.*usage\s+polic', re.IGNORECASE | re.DOTALL),
+    re.compile(r'account\s+(?:has\s+been\s+)?(?:disabled|deactivated|suspended).*violat(?:ed|es|ing).*terms', re.IGNORECASE | re.DOTALL),
+    re.compile(r'openai\s*-\s*access\s+deactivated', re.IGNORECASE),
+]
+DISABLED_ACCOUNT_CHECK_MATCH_RULES = [
+    {
+        'code': 'openai_trust_and_safety_sender',
+        'label': 'OpenAI Trust & Safety 发件人',
+        'description': '邮件发件人包含 trustandsafety@tm.openai.com。',
+    },
+    {
+        'code': 'openai_access_deactivated_subject',
+        'label': 'OpenAI Access Deactivated 标题',
+        'description': '邮件标题包含 OpenAI - Access Deactivated，通常后跟 [C-...] 编号。',
+    },
+    {
+        'code': 'openai_banned_terms_body',
+        'label': '账号违反 Terms/Usage Policies 正文',
+        'description': '邮件正文包含 Your account has been banned because recent activity violated our Terms and Usage Policies。',
+    },
+    {
+        'code': 'disabled_terms_notice',
+        'label': '停用/封禁条款通知',
+        'description': '邮件文本包含账号被 disabled、deactivated、suspended 或 banned 且与 terms/usage policies 相关的通知。',
+    },
+]
+DISABLED_ACCOUNT_CHECK_RULE_LABELS = {
+    rule['code']: rule['label']
+    for rule in DISABLED_ACCOUNT_CHECK_MATCH_RULES
+}
+DISABLED_GROUP_CHECK_TASKS: Dict[str, Dict[str, Any]] = {}
+DISABLED_GROUP_CHECK_TASK_LOCK = threading.Lock()
+DISABLED_GROUP_CHECK_TASK_MAX_AGE_SECONDS = 3600
+
+
+def get_disabled_group_check_max_workers() -> int:
+    try:
+        return max(1, int(os.getenv('DISABLED_GROUP_CHECK_MAX_WORKERS', '6') or 6))
+    except (TypeError, ValueError):
+        return 6
+
+
+DISABLED_GROUP_CHECK_MAX_WORKERS = get_disabled_group_check_max_workers()
+
+
+def normalize_disabled_check_recent_count(value: Any) -> int:
+    try:
+        recent_count = int(value or DISABLED_ACCOUNT_CHECK_RECENT_COUNT)
+    except (TypeError, ValueError):
+        recent_count = DISABLED_ACCOUNT_CHECK_RECENT_COUNT
+    return max(1, min(10, recent_count))
+
+
+def dump_disabled_check_json(value: Any) -> str:
+    if value in (None, ''):
+        return ''
+    try:
+        return json.dumps(value, ensure_ascii=False)
+    except Exception:
+        return ''
+
+
+def load_disabled_check_json(value: Any) -> Any:
+    if not value:
+        return None
+    try:
+        return json.loads(value)
+    except Exception:
+        return None
+
+
+def serialize_disabled_group_check_task_row(row: Any, include_payload: bool = False) -> Dict[str, Any]:
+    task = dict(row)
+    summary = load_disabled_check_json(task.pop('summary_json', '')) or {}
+    status_update = load_disabled_check_json(task.pop('status_update_json', '')) or {}
+    payload = load_disabled_check_json(task.pop('payload_json', '')) if include_payload else None
+    result = {
+        'task_id': task.get('task_id', ''),
+        'group_id': task.get('group_id'),
+        'group_name': task.get('group_name', ''),
+        'status': task.get('status', ''),
+        'task_status': task.get('status', ''),
+        'recent_count': int(task.get('recent_count') or 0),
+        'checked_count': int(task.get('checked_count') or 0),
+        'disabled_count': int(task.get('disabled_count') or 0),
+        'marked_inactive_count': int(task.get('marked_inactive_count') or 0),
+        'error_count': int(task.get('error_count') or 0),
+        'error': task.get('error_message', '') or '',
+        'summary': summary,
+        'status_update': status_update,
+        'created_at': task.get('created_at'),
+        'started_at': task.get('started_at'),
+        'completed_at': task.get('completed_at'),
+        'updated_at': task.get('updated_at'),
+    }
+    if include_payload:
+        result['payload'] = payload
+    return result
+
+
+def create_disabled_group_check_task_record(task_id: str, group_id: int, group_name: str, recent_count: int,
+                                            created_at: str) -> None:
+    db = get_db()
+    db.execute(
+        '''
+        INSERT OR REPLACE INTO group_disabled_check_tasks
+            (task_id, group_id, group_name, status, recent_count, created_at, updated_at)
+        VALUES (?, ?, ?, 'running', ?, ?, ?)
+        ''',
+        (task_id, group_id, group_name or '', recent_count, created_at, created_at)
+    )
+    db.commit()
+
+
+def mark_disabled_group_check_task_started(task_id: str) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    db.execute(
+        '''
+        UPDATE group_disabled_check_tasks
+        SET started_at = COALESCE(started_at, ?), updated_at = ?
+        WHERE task_id = ?
+        ''',
+        (now_iso, now_iso, task_id)
+    )
+    db.commit()
+
+
+def persist_disabled_group_check_task_completion(task_id: str, payload: Dict[str, Any]) -> None:
+    summary = payload.get('summary') or {}
+    status_update = payload.get('status_update') or {}
+    now_iso = datetime.now(timezone.utc).isoformat()
+    db = get_db()
+    db.execute(
+        '''
+        UPDATE group_disabled_check_tasks
+        SET status = 'completed',
+            checked_count = ?,
+            disabled_count = ?,
+            marked_inactive_count = ?,
+            error_count = ?,
+            error_message = '',
+            summary_json = ?,
+            status_update_json = ?,
+            payload_json = ?,
+            completed_at = ?,
+            updated_at = ?
+        WHERE task_id = ?
+        ''',
+        (
+            int(summary.get('checked_count') or 0),
+            int(summary.get('disabled_count') or 0),
+            int(summary.get('marked_inactive_count') or 0),
+            int(summary.get('error_count') or 0),
+            dump_disabled_check_json(summary),
+            dump_disabled_check_json(status_update),
+            dump_disabled_check_json(payload),
+            now_iso,
+            now_iso,
+            task_id,
+        )
+    )
+    db.commit()
+
+
+def persist_disabled_group_check_task_failure(task_id: str, error_message: str,
+                                              payload: Optional[Dict[str, Any]] = None) -> None:
+    now_iso = datetime.now(timezone.utc).isoformat()
+    safe_payload = payload or {}
+    db = get_db()
+    db.execute(
+        '''
+        UPDATE group_disabled_check_tasks
+        SET status = 'failed',
+            error_message = ?,
+            payload_json = ?,
+            completed_at = ?,
+            updated_at = ?
+        WHERE task_id = ?
+        ''',
+        (
+            error_message or '当前分组停用检测失败',
+            dump_disabled_check_json(safe_payload),
+            now_iso,
+            now_iso,
+            task_id,
+        )
+    )
+    db.commit()
+
+
+def get_persisted_disabled_group_check_task(task_id: str, include_payload: bool = False) -> Optional[Dict[str, Any]]:
+    db = get_db()
+    row = db.execute(
+        '''
+        SELECT *
+        FROM group_disabled_check_tasks
+        WHERE task_id = ?
+        ''',
+        (task_id,)
+    ).fetchone()
+    return serialize_disabled_group_check_task_row(row, include_payload=include_payload) if row else None
+
+
+def list_disabled_group_check_task_records(group_id: Optional[int] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    db = get_db()
+    safe_limit = max(1, min(100, int(limit or 50)))
+    if group_id:
+        rows = db.execute(
+            '''
+            SELECT *
+            FROM group_disabled_check_tasks
+            WHERE group_id = ?
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            ''',
+            (group_id, safe_limit)
+        ).fetchall()
+    else:
+        rows = db.execute(
+            '''
+            SELECT *
+            FROM group_disabled_check_tasks
+            ORDER BY datetime(created_at) DESC, id DESC
+            LIMIT ?
+            ''',
+            (safe_limit,)
+        ).fetchall()
+    return [serialize_disabled_group_check_task_row(row) for row in rows]
+
+
+def cleanup_disabled_group_check_tasks() -> None:
+    now_ts = time.time()
+    with DISABLED_GROUP_CHECK_TASK_LOCK:
+        expired_task_ids = [
+            task_id
+            for task_id, task in DISABLED_GROUP_CHECK_TASKS.items()
+            if now_ts - float(task.get('created_ts') or now_ts) > DISABLED_GROUP_CHECK_TASK_MAX_AGE_SECONDS
+        ]
+        for task_id in expired_task_ids:
+            DISABLED_GROUP_CHECK_TASKS.pop(task_id, None)
+
+
+def get_disabled_group_check_task(task_id: str) -> Optional[Dict[str, Any]]:
+    cleanup_disabled_group_check_tasks()
+    with DISABLED_GROUP_CHECK_TASK_LOCK:
+        task = DISABLED_GROUP_CHECK_TASKS.get(task_id)
+        return dict(task) if task else None
+
+
+def update_disabled_group_check_task(task_id: str, **updates) -> None:
+    with DISABLED_GROUP_CHECK_TASK_LOCK:
+        task = DISABLED_GROUP_CHECK_TASKS.get(task_id)
+        if not task:
+            return
+        task.update(updates)
+        task['updated_at'] = datetime.now(timezone.utc).isoformat()
+
+
+def log_disabled_group_check_event(message: str) -> None:
+    print(f'[disabled-check] {message}', flush=True)
+
+
+def run_group_disabled_check_task(task_id: str, group_id: int, data: Dict[str, Any]) -> None:
+    with app.app_context():
+        try:
+            log_disabled_group_check_event(f'task started: task_id={task_id} group_id={group_id}')
+            app.logger.info('group disabled-check task started: task_id=%s group_id=%s', task_id, group_id)
+            mark_disabled_group_check_task_started(task_id)
+            payload, error = build_group_disabled_check_payload(group_id, data)
+            if error:
+                error_payload, status_code = error
+                error_message = error_payload.get('error') or '当前分组停用检测失败'
+                update_disabled_group_check_task(
+                    task_id,
+                    status='failed',
+                    http_status=status_code,
+                    error=error_message,
+                    payload=error_payload,
+                    completed_at=datetime.now(timezone.utc).isoformat(),
+                )
+                persist_disabled_group_check_task_failure(task_id, error_message, error_payload)
+                app.logger.warning(
+                    'group disabled-check task failed: task_id=%s group_id=%s status=%s error=%s',
+                    task_id,
+                    group_id,
+                    status_code,
+                    error_payload.get('error'),
+                )
+                log_disabled_group_check_event(
+                    f'task failed: task_id={task_id} group_id={group_id} status={status_code} error={error_payload.get("error")}'
+                )
+                return
+
+            persist_disabled_group_check_task_completion(task_id, payload)
+            update_disabled_group_check_task(
+                task_id,
+                status='completed',
+                payload=payload,
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            summary = payload.get('summary') or {}
+            app.logger.info(
+                'group disabled-check task completed: task_id=%s group_id=%s checked=%s disabled=%s marked=%s errors=%s',
+                task_id,
+                group_id,
+                summary.get('checked_count'),
+                summary.get('disabled_count'),
+                summary.get('marked_inactive_count'),
+                summary.get('error_count'),
+            )
+            log_disabled_group_check_event(
+                f'task completed: task_id={task_id} group_id={group_id} checked={summary.get("checked_count")} '
+                f'disabled={summary.get("disabled_count")} marked={summary.get("marked_inactive_count")} errors={summary.get("error_count")}'
+            )
+        except Exception as exc:
+            error_message = sanitize_error_details(str(exc))
+            persist_disabled_group_check_task_failure(task_id, error_message, {'success': False, 'error': error_message})
+            update_disabled_group_check_task(
+                task_id,
+                status='failed',
+                error=error_message,
+                payload={'success': False, 'error': error_message},
+                completed_at=datetime.now(timezone.utc).isoformat(),
+            )
+            app.logger.exception('group disabled-check task crashed: task_id=%s group_id=%s', task_id, group_id)
+            log_disabled_group_check_event(f'task crashed: task_id={task_id} group_id={group_id} error={error_message}')
+
+
+def normalize_disabled_check_email_inputs(raw_emails: Any = None, raw_text: str = '') -> List[Dict[str, Any]]:
+    values: List[str] = []
+    if isinstance(raw_emails, list):
+        values.extend(str(value or '') for value in raw_emails)
+    elif isinstance(raw_emails, str):
+        values.extend(raw_emails.splitlines())
+
+    if raw_text:
+        values.extend(str(raw_text or '').splitlines())
+
+    items = []
+    for index, value in enumerate(values, start=1):
+        email_addr = str(value or '').strip()
+        if not email_addr:
+            continue
+        items.append({
+            'line': index,
+            'email': email_addr,
+            'normalized_email': normalize_email_address(email_addr),
+        })
+    return items
+
+
+def clean_disabled_check_text(value: Any) -> str:
+    text = str(value or '')
+    if not text:
+        return ''
+    text = strip_html_content(text)
+    try:
+        text = html.unescape(text)
+    except Exception:
+        pass
+    return re.sub(r'\s+', ' ', text).strip()
+
+
+def text_matches_disabled_account_notice(value: Any) -> bool:
+    return disabled_match_codes_indicate_disabled(get_disabled_account_notice_match_codes(value))
+
+
+def get_disabled_account_notice_match_codes(value: Any) -> List[str]:
+    text = clean_disabled_check_text(value)
+    if not text:
+        return []
+
+    match_codes = []
+    if re.search(r'trustandsafety@tm\.openai\.com', text, re.IGNORECASE):
+        match_codes.append('openai_trust_and_safety_sender')
+    if re.search(r'openai\s*-\s*access\s+deactivated(?:\s*\[[^\]]+\])?', text, re.IGNORECASE):
+        match_codes.append('openai_access_deactivated_subject')
+    if re.search(
+        r'your\s+account\s+has\s+been\s+banned\s+because\s+recent\s+activity\s+violated\s+our\s+terms\s+and\s+usage\s+policies',
+        text,
+        re.IGNORECASE,
+    ):
+        match_codes.append('openai_banned_terms_body')
+    if any(pattern.search(text) for pattern in DISABLED_ACCOUNT_CHECK_PATTERNS):
+        match_codes.append('disabled_terms_notice')
+
+    return list(dict.fromkeys(match_codes))
+
+
+def disabled_match_codes_indicate_disabled(match_codes: List[str]) -> bool:
+    disabled_signal_codes = {
+        'openai_access_deactivated_subject',
+        'openai_banned_terms_body',
+        'disabled_terms_notice',
+    }
+    return any(code in disabled_signal_codes for code in match_codes)
+
+
+def stringify_disabled_check_error(error: Any) -> str:
+    if isinstance(error, dict):
+        return str(error.get('message') or error.get('code') or error)
+    return str(error or '')
+
+
+def build_disabled_check_detail_text(account: Dict[str, Any], email_item: Dict[str, Any],
+                                     proxy_url: str = '', fallback_proxy_urls: Optional[List[str]] = None) -> tuple[str, str]:
+    message_id = str(email_item.get('id') or '').strip()
+    folder = normalize_folder_name(email_item.get('folder') or 'inbox')
+    id_mode = str(email_item.get('id_mode') or '').strip().lower()
+    pieces = [
+        email_item.get('subject', ''),
+        email_item.get('from', ''),
+        email_item.get('to', ''),
+        email_item.get('body_preview', ''),
+    ]
+
+    if not message_id:
+        return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), 'message_id 为空'
+
+    try:
+        if account.get('account_type') == 'imap':
+            detail_result = get_email_detail_imap_generic_result(
+                account['email'],
+                account.get('imap_password', ''),
+                account.get('imap_host', ''),
+                account.get('imap_port', 993),
+                message_id,
+                folder,
+                account.get('provider', 'custom'),
+                proxy_url,
+            )
+            if detail_result.get('success'):
+                detail = detail_result.get('email') or {}
+                pieces.extend([detail.get('subject', ''), detail.get('from', ''), detail.get('to', ''), detail.get('body', '')])
+            else:
+                return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), stringify_disabled_check_error(detail_result.get('error'))
+        elif id_mode == 'graph':
+            detail = get_email_detail_graph(
+                account['client_id'],
+                account['refresh_token'],
+                message_id,
+                proxy_url,
+                fallback_proxy_urls,
+            )
+            if detail:
+                pieces.extend([
+                    detail.get('subject', ''),
+                    detail.get('bodyPreview', ''),
+                    (detail.get('body') or {}).get('content', ''),
+                ])
+            else:
+                return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), 'Graph 邮件详情获取失败'
+        else:
+            detail = get_email_detail_imap(
+                account['email'],
+                account['client_id'],
+                account['refresh_token'],
+                message_id,
+                folder,
+                proxy_url,
+                fallback_proxy_urls,
+            )
+            if detail:
+                pieces.extend([detail.get('subject', ''), detail.get('from', ''), detail.get('to', ''), detail.get('body', '')])
+            else:
+                return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), 'IMAP 邮件详情获取失败'
+    except Exception as exc:
+        return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), sanitize_error_details(str(exc))
+
+    return clean_disabled_check_text(' '.join(str(piece or '') for piece in pieces)), ''
+
+
+def summarize_disabled_check_email_item(email_item: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        'id': email_item.get('id', ''),
+        'folder': email_item.get('folder', ''),
+        'subject': email_item.get('subject', '') or '无主题',
+        'from': email_item.get('from', '') or '',
+        'date': email_item.get('date', '') or '',
+    }
+
+
+def enrich_disabled_check_match_summary(summary: Dict[str, Any], match_codes: List[str]) -> Dict[str, Any]:
+    enriched = dict(summary)
+    enriched['match_codes'] = match_codes
+    enriched['match_labels'] = [
+        DISABLED_ACCOUNT_CHECK_RULE_LABELS.get(code, code)
+        for code in match_codes
+    ]
+    return enriched
+
+
+def scan_account_for_disabled_notice_with_proxy(account: Dict[str, Any],
+                                                recent_count: int,
+                                                proxy_url: str = '',
+                                                fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    top = max(1, min(10, int(recent_count or DISABLED_ACCOUNT_CHECK_RECENT_COUNT)))
+    result = fetch_account_emails_with_proxy(account, 'all', 0, top, proxy_url, fallback_proxy_urls or [])
+    if not result.get('success'):
+        return {
+            'success': False,
+            'status': 'error',
+            'disabled': False,
+            'error': stringify_disabled_check_error(result.get('error') or result.get('details')),
+            'checked_count': 0,
+            'checked_emails': [],
+            'matched_emails': [],
+        }
+
+    emails = list(result.get('emails') or [])[:top]
+    checked_emails = []
+    matched_emails = []
+    detail_errors = []
+    for email_item in emails:
+        summary = summarize_disabled_check_email_item(email_item)
+        checked_emails.append(summary)
+        text, detail_error = build_disabled_check_detail_text(account, email_item, proxy_url, fallback_proxy_urls)
+        if detail_error:
+            detail_errors.append({
+                'subject': summary.get('subject', ''),
+                'error': detail_error,
+            })
+        match_codes = get_disabled_account_notice_match_codes(text)
+        if disabled_match_codes_indicate_disabled(match_codes):
+            matched_emails.append(enrich_disabled_check_match_summary(summary, match_codes))
+
+    disabled = bool(matched_emails)
+    payload = {
+        'success': True,
+        'status': 'disabled' if disabled else 'active',
+        'disabled': disabled,
+        'checked_count': len(checked_emails),
+        'checked_emails': checked_emails,
+        'matched_emails': matched_emails,
+    }
+    if detail_errors:
+        payload['detail_errors'] = detail_errors
+    return payload
+
+
+def scan_account_for_disabled_notice(account: Dict[str, Any],
+                                     recent_count: int = DISABLED_ACCOUNT_CHECK_RECENT_COUNT) -> Dict[str, Any]:
+    proxy_url = get_account_proxy_url(account)
+    fallback_proxy_urls = get_account_proxy_failover_urls(account)
+    return scan_account_for_disabled_notice_with_proxy(account, recent_count, proxy_url, fallback_proxy_urls)
+
+
+def build_disabled_check_row_result(item: Dict[str, Any], recent_count: int) -> Dict[str, Any]:
+    email_addr = item.get('email', '')
+    normalized_email = item.get('normalized_email', '')
+    base_result = {
+        'line': item.get('line'),
+        'email': email_addr,
+        'normalized_email': normalized_email,
+        'found': False,
+        'account_id': None,
+        'account_status': '',
+        'disabled': False,
+        'status': 'invalid',
+        'status_label': '格式无效',
+        'checked_count': 0,
+        'checked_emails': [],
+        'matched_emails': [],
+        'error': '',
+    }
+    if not normalized_email or '@' not in normalized_email:
+        return base_result
+
+    account = get_account_by_email(normalized_email)
+    if not account:
+        return {
+            **base_result,
+            'status': 'not_found',
+            'status_label': '未导入系统',
+            'error': '该邮箱不在当前系统账号库中',
+        }
+
+    scan_result = scan_account_for_disabled_notice(account, recent_count)
+    disabled = bool(scan_result.get('disabled'))
+    if scan_result.get('success'):
+        status = 'disabled' if disabled else 'active'
+        status_label = '已停用' if disabled else '未命中停用通知'
+        error = ''
+    else:
+        status = 'error'
+        status_label = '检测失败'
+        error = scan_result.get('error') or '检测失败'
+
+    return {
+        **base_result,
+        'found': True,
+        'account_id': account.get('id'),
+        'account_status': normalize_account_status(account.get('status', 'active')),
+        'disabled': disabled,
+        'status': status,
+        'status_label': status_label,
+        'checked_count': int(scan_result.get('checked_count') or 0),
+        'checked_emails': scan_result.get('checked_emails') or [],
+        'matched_emails': scan_result.get('matched_emails') or [],
+        'detail_errors': scan_result.get('detail_errors') or [],
+        'error': error,
+    }
+
+
+def build_group_disabled_check_row_result(account: Dict[str, Any], index: int, group_id: int,
+                                          group_name: str, recent_count: int, proxy_url: str = '',
+                                          fallback_proxy_urls: Optional[List[str]] = None) -> Dict[str, Any]:
+    email_addr = account.get('email', '')
+    normalized_email = normalize_email_address(email_addr)
+    base_result = {
+        'line': index,
+        'email': email_addr,
+        'normalized_email': normalized_email,
+        'found': False,
+        'account_id': account.get('id'),
+        'account_status': normalize_account_status(account.get('status', 'active')),
+        'disabled': False,
+        'status': 'invalid',
+        'status_label': '格式无效',
+        'checked_count': 0,
+        'checked_emails': [],
+        'matched_emails': [],
+        'detail_errors': [],
+        'error': '',
+        'group_id': group_id,
+        'group_name': group_name,
+        'marked_inactive': False,
+        'account_status_after': normalize_account_status(account.get('status', 'active')),
+    }
+    if not normalized_email or '@' not in normalized_email:
+        return base_result
+
+    try:
+        scan_result = scan_account_for_disabled_notice_with_proxy(
+            dict(account),
+            recent_count,
+            proxy_url,
+            fallback_proxy_urls or [],
+        )
+    except Exception as exc:
+        return {
+            **base_result,
+            'found': True,
+            'status': 'error',
+            'status_label': '检测失败',
+            'error': sanitize_error_details(str(exc)) or '检测失败',
+        }
+
+    disabled = bool(scan_result.get('disabled'))
+    if scan_result.get('success'):
+        status = 'disabled' if disabled else 'active'
+        status_label = '已停用' if disabled else '未命中停用通知'
+        error = ''
+    else:
+        status = 'error'
+        status_label = '检测失败'
+        error = scan_result.get('error') or '检测失败'
+
+    return {
+        **base_result,
+        'found': True,
+        'disabled': disabled,
+        'status': status,
+        'status_label': status_label,
+        'checked_count': int(scan_result.get('checked_count') or 0),
+        'checked_emails': scan_result.get('checked_emails') or [],
+        'matched_emails': scan_result.get('matched_emails') or [],
+        'detail_errors': scan_result.get('detail_errors') or [],
+        'error': error,
+    }
+
+
+def build_disabled_check_summary(results: List[Dict[str, Any]]) -> Dict[str, Any]:
+    valid_results = [row for row in results if row.get('status') != 'invalid']
+    found_results = [row for row in valid_results if row.get('found')]
+    checked_results = [row for row in found_results if row.get('status') in {'active', 'disabled'}]
+    disabled_count = sum(1 for row in checked_results if row.get('disabled'))
+    checked_count = len(checked_results)
+    disabled_rate = round((disabled_count / checked_count) * 100, 2) if checked_count else 0.0
+    return {
+        'input_count': len(results),
+        'valid_count': len(valid_results),
+        'found_count': len(found_results),
+        'checked_count': checked_count,
+        'disabled_count': disabled_count,
+        'active_count': max(0, checked_count - disabled_count),
+        'not_found_count': sum(1 for row in valid_results if row.get('status') == 'not_found'),
+        'invalid_count': sum(1 for row in results if row.get('status') == 'invalid'),
+        'error_count': sum(1 for row in results if row.get('status') == 'error'),
+        'disabled_rate': disabled_rate,
+    }
+
+
+def build_disabled_check_api_documentation() -> Dict[str, Any]:
+    return {
+        'endpoint': '/api/external/accounts/disabled-check',
+        'method': 'POST',
+        'auth': {
+            'type': 'API Key',
+            'header': 'X-API-Key: <your-api-key>',
+            'query_aliases': ['api_key', 'apikey', 'api_token'],
+        },
+        'request_body': {
+            'email': 'string，可选；单个邮箱账号，和 emails/text 可合并使用',
+            'emails': 'string[] 或多行 string，可选；多个邮箱账号',
+            'text': 'string，可选；多行邮箱账号，每行一个',
+            'recent_count': f'int，可选；每个账号检测最近几封邮件，默认 {DISABLED_ACCOUNT_CHECK_RECENT_COUNT}，范围 1-10',
+        },
+        'response_fields': {
+            'success': '接口是否成功处理请求',
+            'recent_count': '本次每个账号检测的最近邮件数量',
+            'summary.input_count': '输入行数',
+            'summary.valid_count': '格式有效的输入数',
+            'summary.found_count': '在本系统账号库中找到的账号数',
+            'summary.checked_count': '实际完成邮件检测的账号数',
+            'summary.disabled_count': '检测为停用/封禁的账号数',
+            'summary.disabled_rate': '停用账号占已检测账号的百分比',
+            'results[].status': 'invalid/not_found/active/disabled/error',
+            'results[].disabled': '是否命中停用通知',
+            'results[].matched_emails': '命中的最近邮件摘要，包含 match_codes 和 match_labels',
+        },
+        'detection_rules': DISABLED_ACCOUNT_CHECK_MATCH_RULES,
+        'notes': [
+            '接口只检测已导入本系统且有可用凭据的邮箱账号；未导入账号返回 not_found。',
+            f'检测会读取 inbox 和 junkemail 最近邮件并按时间合并，默认检查最近 {DISABLED_ACCOUNT_CHECK_RECENT_COUNT} 封。',
+            '发件人 trustandsafety@tm.openai.com 会作为命中依据返回；真正判定 disabled=true 需要同时命中标题/正文/条款封禁类停用信号之一。',
+            '该对外接口只返回检测结果，不会自动修改账号 status；需要修改状态时请调用内部页面批量操作或另行接入状态更新接口。',
+        ],
+    }
+
+
+def build_disabled_check_payload(data: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[tuple[Dict[str, Any], int]]]:
+    raw_emails = data.get('emails')
+    if data.get('email') is not None:
+        if isinstance(raw_emails, list):
+            raw_emails = [data.get('email')] + raw_emails
+        elif raw_emails:
+            raw_emails = f"{data.get('email')}\n{raw_emails}"
+        else:
+            raw_emails = [data.get('email')]
+
+    input_items = normalize_disabled_check_email_inputs(raw_emails, data.get('text', ''))
+    if not input_items:
+        return None, ({'success': False, 'error': '请输入要检测的邮箱账号'}, 400)
+
+    if len(input_items) > DISABLED_ACCOUNT_CHECK_MAX_EMAILS:
+        return None, ({
+            'success': False,
+            'error': f'单次最多检测 {DISABLED_ACCOUNT_CHECK_MAX_EMAILS} 个邮箱账号',
+            'max_count': DISABLED_ACCOUNT_CHECK_MAX_EMAILS,
+        }, 400)
+
+    recent_count = normalize_disabled_check_recent_count(data.get('recent_count'))
+
+    cached_results: Dict[str, Dict[str, Any]] = {}
+    results = []
+    for item in input_items:
+        normalized_email = item.get('normalized_email', '')
+        if normalized_email and normalized_email in cached_results:
+            cached = dict(cached_results[normalized_email])
+            cached['line'] = item.get('line')
+            cached['email'] = item.get('email')
+            results.append(cached)
+            continue
+
+        row_result = build_disabled_check_row_result(item, recent_count)
+        if normalized_email:
+            cached_results[normalized_email] = dict(row_result)
+        results.append(row_result)
+
+    return {
+        'success': True,
+        'recent_count': recent_count,
+        'results': results,
+        'summary': build_disabled_check_summary(results),
+    }, None
+
+
+def build_group_disabled_check_payload(group_id: int, data: Dict[str, Any]) -> tuple[Optional[Dict[str, Any]], Optional[tuple[Dict[str, Any], int]]]:
+    group = get_group_by_id(group_id)
+    if not group:
+        return None, ({'success': False, 'error': '分组不存在'}, 404)
+
+    recent_count = normalize_disabled_check_recent_count(data.get('recent_count'))
+
+    accounts = load_accounts(group_id)
+    group_name = group.get('name', '')
+    proxy_url = get_group_proxy_url(group)
+    fallback_proxy_urls = get_group_proxy_failover_urls(group)
+    results: List[Dict[str, Any]] = []
+    disabled_account_ids: List[int] = []
+    if accounts:
+        ordered_results: List[Optional[Dict[str, Any]]] = [None] * len(accounts)
+        worker_count = min(len(accounts), DISABLED_GROUP_CHECK_MAX_WORKERS)
+        with ThreadPoolExecutor(max_workers=worker_count, thread_name_prefix='disabled-check-account') as executor:
+            future_to_index = {
+                executor.submit(
+                    build_group_disabled_check_row_result,
+                    dict(account),
+                    index,
+                    group_id,
+                    group_name,
+                    recent_count,
+                    proxy_url,
+                    fallback_proxy_urls,
+                ): index - 1
+                for index, account in enumerate(accounts, start=1)
+            }
+            for future in as_completed(future_to_index):
+                result_index = future_to_index[future]
+                ordered_results[result_index] = future.result()
+        results = [row for row in ordered_results if row is not None]
+
+    for row_result in results:
+        if row_result.get('found') and row_result.get('disabled') and row_result.get('account_id'):
+            disabled_account_ids.append(int(row_result['account_id']))
+
+    update_result = {
+        'success': True,
+        'status': 'inactive',
+        'updated_count': 0,
+        'updated_accounts': [],
+        'unchanged_count': 0,
+        'missing_ids': [],
+    }
+    if disabled_account_ids:
+        update_result = update_accounts_status_by_ids(disabled_account_ids, 'inactive')
+        if not update_result.get('success'):
+            return None, ({
+                'success': False,
+                'error': update_result.get('error') or '标注停用账号失败',
+                'results': results,
+                'summary': build_disabled_check_summary(results),
+            }, 500)
+
+    updated_ids = {
+        int(account.get('id'))
+        for account in update_result.get('updated_accounts', [])
+        if account.get('id') is not None
+    }
+    disabled_id_set = set(disabled_account_ids)
+    for row_result in results:
+        account_id = row_result.get('account_id')
+        if not account_id:
+            continue
+        if int(account_id) in disabled_id_set:
+            row_result['account_status_after'] = 'inactive'
+        if int(account_id) in updated_ids:
+            row_result['marked_inactive'] = True
+
+    summary = build_disabled_check_summary(results)
+    summary['marked_inactive_count'] = int(update_result.get('updated_count') or 0)
+    summary['already_inactive_count'] = int(update_result.get('unchanged_count') or 0)
+    summary['group_account_count'] = len(accounts)
+
+    return {
+        'success': True,
+        'group': {
+            'id': group.get('id'),
+            'name': group.get('name', ''),
+        },
+        'recent_count': recent_count,
+        'results': results,
+        'summary': summary,
+        'status_update': {
+            'status': update_result.get('status'),
+            'updated_count': update_result.get('updated_count', 0),
+            'updated_accounts': update_result.get('updated_accounts', []),
+            'unchanged_count': update_result.get('unchanged_count', 0),
+            'missing_ids': update_result.get('missing_ids', []),
+        },
+        'message': f"当前分组检测完成：发现停用 {summary['disabled_count']} 个，本次标注 {summary['marked_inactive_count']} 个",
+    }, None
+
+
+@app.route('/api/accounts/disabled-check', methods=['POST'])
+@login_required
+def api_batch_check_disabled_accounts():
+    """批量检测账号最近邮件中是否包含停用通知。"""
+    data = request.get_json(silent=True) or {}
+    payload, error = build_disabled_check_payload(data)
+    if error:
+        return jsonify(error[0])
+    return jsonify(payload)
+
+
+@app.route('/api/groups/<int:group_id>/accounts/disabled-check', methods=['POST'])
+@login_required
+def api_check_group_disabled_accounts(group_id: int):
+    """检测指定分组内所有账号，命中停用通知后自动标注为停用。"""
+    data = request.get_json(silent=True) or {}
+    if data.get('async') is False:
+        payload, error = build_group_disabled_check_payload(group_id, data)
+        if error:
+            return jsonify(error[0]), error[1]
+        return jsonify(payload)
+
+    group = get_group_by_id(group_id)
+    if not group:
+        return jsonify({'success': False, 'error': '分组不存在'}), 404
+
+    cleanup_disabled_group_check_tasks()
+    task_id = uuid.uuid4().hex
+    now_iso = datetime.now(timezone.utc).isoformat()
+    recent_count = normalize_disabled_check_recent_count(data.get('recent_count'))
+    create_disabled_group_check_task_record(task_id, group_id, group.get('name', ''), recent_count, now_iso)
+    with DISABLED_GROUP_CHECK_TASK_LOCK:
+        DISABLED_GROUP_CHECK_TASKS[task_id] = {
+            'success': True,
+            'task_id': task_id,
+            'group_id': group_id,
+            'group_name': group.get('name', ''),
+            'status': 'running',
+            'recent_count': recent_count,
+            'created_ts': time.time(),
+            'created_at': now_iso,
+            'updated_at': now_iso,
+            'payload': None,
+            'error': '',
+        }
+
+    app.logger.info('group disabled-check task accepted: task_id=%s group_id=%s', task_id, group_id)
+    log_disabled_group_check_event(f'task accepted: task_id={task_id} group_id={group_id}')
+    worker = threading.Thread(
+        target=run_group_disabled_check_task,
+        args=(task_id, group_id, dict(data)),
+        name=f'disabled-check-group-{group_id}-{task_id[:8]}',
+        daemon=True,
+    )
+    worker.start()
+    return jsonify({
+        'success': True,
+        'status': 'running',
+        'task_id': task_id,
+        'group_id': group_id,
+        'message': '当前分组停用检测任务已启动',
+    }), 202
+
+
+@app.route('/api/groups/disabled-check-tasks/<task_id>', methods=['GET'])
+@login_required
+def api_get_group_disabled_check_task(task_id: str):
+    task = get_disabled_group_check_task(task_id)
+    if not task:
+        persisted_task = get_persisted_disabled_group_check_task(task_id, include_payload=True)
+        if not persisted_task:
+            return jsonify({'success': False, 'error': '检测任务不存在或已过期'}), 404
+        payload = persisted_task.get('payload')
+        if persisted_task.get('status') == 'completed' and isinstance(payload, dict):
+            return jsonify({
+                **payload,
+                'task_id': persisted_task.get('task_id'),
+                'task_status': 'completed',
+                'history_record': persisted_task,
+            })
+        if persisted_task.get('status') == 'failed':
+            return jsonify({
+                'success': False,
+                'task_id': persisted_task.get('task_id'),
+                'task_status': 'failed',
+                'error': persisted_task.get('error') or '当前分组停用检测失败',
+                'payload': payload,
+                'history_record': persisted_task,
+            }), 500
+        return jsonify({
+            'success': True,
+            'task_id': persisted_task.get('task_id'),
+            'group_id': persisted_task.get('group_id'),
+            'group_name': persisted_task.get('group_name', ''),
+            'task_status': 'running',
+            'status': 'running',
+            'message': '当前分组停用检测仍在执行',
+            'created_at': persisted_task.get('created_at'),
+            'updated_at': persisted_task.get('updated_at'),
+        })
+
+    payload = task.get('payload')
+    if task.get('status') == 'completed' and isinstance(payload, dict):
+        return jsonify({
+            **payload,
+            'task_id': task.get('task_id'),
+            'task_status': 'completed',
+        })
+
+    if task.get('status') == 'failed':
+        return jsonify({
+            'success': False,
+            'task_id': task.get('task_id'),
+            'task_status': 'failed',
+            'error': task.get('error') or '当前分组停用检测失败',
+            'payload': payload,
+        }), int(task.get('http_status') or 500)
+
+    return jsonify({
+        'success': True,
+        'task_id': task.get('task_id'),
+        'group_id': task.get('group_id'),
+        'task_status': 'running',
+        'status': 'running',
+        'message': '当前分组停用检测仍在执行',
+        'created_at': task.get('created_at'),
+        'updated_at': task.get('updated_at'),
+    })
+
+
+@app.route('/api/groups/disabled-check-tasks/history', methods=['GET'])
+@login_required
+def api_list_group_disabled_check_tasks():
+    try:
+        group_id = int(request.args.get('group_id') or 0)
+    except (TypeError, ValueError):
+        group_id = 0
+    try:
+        limit = int(request.args.get('limit') or 50)
+    except (TypeError, ValueError):
+        limit = 50
+
+    tasks = list_disabled_group_check_task_records(group_id=group_id or None, limit=limit)
+    return jsonify({
+        'success': True,
+        'tasks': tasks,
+        'total': len(tasks),
+    })
+
+
+@app.route('/api/groups/<int:group_id>/accounts/disabled-check-sync', methods=['POST'])
+@login_required
+def api_check_group_disabled_accounts_sync(group_id: int):
+    """兼容同步检测入口，主要用于测试和内部诊断。"""
+    data = request.get_json(silent=True) or {}
+    payload, error = build_group_disabled_check_payload(group_id, data)
+    if error:
+        return jsonify(error[0]), error[1]
+    return jsonify(payload)
+
+
+@app.route('/api/external/accounts/disabled-check', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_check_disabled_accounts():
+    """
+    对外 API：检测账号最近邮件中是否包含停用通知。
+
+    认证：
+    - Header: X-API-Key: <your-api-key>
+    - 或 Query: api_key / apikey / api_token
+
+    JSON 请求体：
+    - email: 单个邮箱账号，可选
+    - emails: 多个邮箱账号，可传数组或多行字符串，可选
+    - text: 多行邮箱账号，每行一个，可选
+    - recent_count: 每个账号检测最近几封邮件，默认 10，范围 1-10
+
+    检测依据：
+    - 发件人包含 trustandsafety@tm.openai.com
+    - 标题包含 OpenAI - Access Deactivated [C-...]
+    - 正文包含 Your account has been banned because recent activity violated our Terms and Usage Policies.
+
+    说明：
+    - 只检测已导入系统的账号，不会自动修改账号 status。
+    - 响应中的 documentation 字段包含完整对接说明和字段解释。
+    """
+    data = request.get_json(silent=True) or {}
+    payload, error = build_disabled_check_payload(data)
+    if error:
+        error_payload, status_code = error
+        error_payload['documentation'] = build_disabled_check_api_documentation()
+        return jsonify(error_payload), status_code
+
+    payload['documentation'] = build_disabled_check_api_documentation()
+    return jsonify(payload)
 
 
 @app.route('/api/emails/<email_addr>')

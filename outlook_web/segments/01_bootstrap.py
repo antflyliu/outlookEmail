@@ -1082,6 +1082,29 @@ def init_db():
     ''')
 
     cursor.execute('''
+        CREATE TABLE IF NOT EXISTS group_disabled_check_tasks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task_id TEXT UNIQUE NOT NULL,
+            group_id INTEGER NOT NULL,
+            group_name TEXT DEFAULT '',
+            status TEXT NOT NULL DEFAULT 'running',
+            recent_count INTEGER DEFAULT 2,
+            checked_count INTEGER DEFAULT 0,
+            disabled_count INTEGER DEFAULT 0,
+            marked_inactive_count INTEGER DEFAULT 0,
+            error_count INTEGER DEFAULT 0,
+            error_message TEXT DEFAULT '',
+            summary_json TEXT DEFAULT '',
+            status_update_json TEXT DEFAULT '',
+            payload_json TEXT DEFAULT '',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+            started_at TIMESTAMP,
+            completed_at TIMESTAMP,
+            updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    ''')
+
+    cursor.execute('''
         CREATE TABLE IF NOT EXISTS token_refresh_state (
             scope_key TEXT PRIMARY KEY,
             trigger_type TEXT DEFAULT '',
@@ -1277,6 +1300,14 @@ def init_db():
     cursor.execute('''
         CREATE INDEX IF NOT EXISTS idx_project_events_project_created
         ON project_account_events(project_id, created_at)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_group_disabled_check_tasks_created
+        ON group_disabled_check_tasks(created_at)
+    ''')
+    cursor.execute('''
+        CREATE INDEX IF NOT EXISTS idx_group_disabled_check_tasks_group_created
+        ON group_disabled_check_tasks(group_id, created_at)
     ''')
 
     # 检查并添加缺失的列（数据库迁移）

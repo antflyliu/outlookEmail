@@ -33,6 +33,7 @@
 | 方法 | 路径 | 鉴权 | 返回类型 | 说明 |
 | --- | --- | --- | --- | --- |
 | GET | `/api/external/accounts` | API Key | JSON | 获取普通邮箱账号列表 |
+| POST | `/api/external/accounts/disabled-check` | API Key | JSON | 检测邮箱账号是否收到停用/封禁通知 |
 | GET | `/api/external/emails` | API Key | JSON | 获取指定邮箱邮件列表 |
 
 ### 分组、账号、标签、项目
@@ -462,6 +463,159 @@ curl -H "X-API-Key: your-api-key" \
 4. `user@googlemail.com`
 
 如果使用回退候选命中，响应会包含 `resolved_query_email`、`fallback_used`、`fallback_email` 等字段。
+
+### POST `/api/external/accounts/disabled-check`
+
+检测一个或多个已导入系统的邮箱账号最近邮件中是否包含停用/封禁通知，供外部服务判断账号是否已被 OpenAI 停用。
+
+#### 鉴权
+
+使用对外 API Key，和其他 `/api/external/*` 接口一致：
+
+- Header：`X-API-Key: your-api-key`
+- Query：`?api_key=your-api-key`
+- Query 别名：`apikey`、`api_token`
+
+#### 请求体
+
+| 参数 | 类型 | 必填 | 说明 |
+| --- | --- | --- | --- |
+| `email` | string | 否 | 单个邮箱账号，可与 `emails` / `text` 合并使用 |
+| `emails` | string[] 或 string | 否 | 多个邮箱账号；传 string 时按换行拆分 |
+| `text` | string | 否 | 多行邮箱账号，每行一个，适合直接粘贴 TXT 内容 |
+| `recent_count` | int | 否 | 每个账号检测最近几封邮件，默认 `10`，范围 `1-10` |
+
+`email`、`emails`、`text` 至少提供一种。单次最多检测 `200` 个输入账号。接口只检测已导入系统、且凭据可用的账号；未导入账号会返回 `not_found`。
+
+#### 检测逻辑
+
+后端复用 Web 端批量停用检测逻辑：
+
+1. 按账号读取 `inbox` 和 `junkemail`，合并后取最近 `recent_count` 封邮件。
+2. 拉取邮件详情，组合发件人、标题、预览和正文文本。
+3. 识别以下停用特征，并在 `matched_emails[].match_codes` 中返回命中依据：
+   - 发件人包含 `trustandsafety@tm.openai.com`，作为辅助证据返回；单独命中发件人不会判停用
+   - 标题包含 `OpenAI - Access Deactivated [C-...]`
+   - 正文包含 `Your account has been banned because recent activity violated our Terms and Usage Policies.`
+   - 其他包含 `banned` / `disabled` / `deactivated` / `suspended` 且关联 `terms` / `usage policies` 的停用通知
+
+如果一封邮件同时包含上述三项：发件人 `trustandsafety@tm.openai.com`、标题 `OpenAI - Access Deactivated [C-...]`、正文中的 banned/Terms and Usage Policies 文案，即可确定为账号已停用。
+
+`disabled=true` 的判定来自标题、正文或条款封禁类停用信号；发件人用于提高对接侧可解释性和人工复核效率。
+
+该接口只返回检测结果，不会自动修改账号 `status`。如需把账号标为停用，可根据返回的 `results[].disabled` 在业务侧调用对应管理流程。
+
+#### 请求示例
+
+```bash
+curl -X POST \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"email":"user@outlook.com","recent_count":10}' \
+  "http://localhost:5000/api/external/accounts/disabled-check"
+
+curl -X POST \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"emails":["a@outlook.com","b@outlook.com"],"recent_count":10}' \
+  "http://localhost:5000/api/external/accounts/disabled-check"
+
+curl -X POST \
+  -H "X-API-Key: your-api-key" \
+  -H "Content-Type: application/json" \
+  -d '{"text":"a@outlook.com\nb@outlook.com"}' \
+  "http://localhost:5000/api/external/accounts/disabled-check"
+```
+
+#### 成功响应示例
+
+```json
+{
+  "success": true,
+  "recent_count": 10,
+  "summary": {
+    "input_count": 2,
+    "valid_count": 2,
+    "found_count": 2,
+    "checked_count": 2,
+    "disabled_count": 1,
+    "active_count": 1,
+    "not_found_count": 0,
+    "invalid_count": 0,
+    "error_count": 0,
+    "disabled_rate": 50.0
+  },
+  "results": [
+    {
+      "line": 1,
+      "email": "user@outlook.com",
+      "normalized_email": "user@outlook.com",
+      "found": true,
+      "account_id": 1,
+      "account_status": "active",
+      "status": "disabled",
+      "status_label": "已停用",
+      "disabled": true,
+      "checked_count": 10,
+      "checked_emails": [
+        {
+          "id": "AAMk...",
+          "folder": "inbox",
+          "subject": "OpenAI - Access Deactivated [C-HgCbekMTuc4z]",
+          "from": "trustandsafety@tm.openai.com",
+          "date": "2026-05-28T00:00:00Z"
+        }
+      ],
+      "matched_emails": [
+        {
+          "id": "AAMk...",
+          "folder": "inbox",
+          "subject": "OpenAI - Access Deactivated [C-HgCbekMTuc4z]",
+          "from": "trustandsafety@tm.openai.com",
+          "date": "2026-05-28T00:00:00Z",
+          "match_codes": [
+            "openai_trust_and_safety_sender",
+            "openai_access_deactivated_subject",
+            "openai_banned_terms_body"
+          ],
+          "match_labels": [
+            "OpenAI Trust & Safety 发件人",
+            "OpenAI Access Deactivated 标题",
+            "账号违反 Terms/Usage Policies 正文"
+          ]
+        }
+      ],
+      "error": ""
+    }
+  ],
+  "documentation": {
+    "endpoint": "/api/external/accounts/disabled-check",
+    "method": "POST",
+    "auth": {
+      "type": "API Key",
+      "header": "X-API-Key: <your-api-key>",
+      "query_aliases": ["api_key", "apikey", "api_token"]
+    },
+    "detection_rules": [
+      {
+        "code": "openai_trust_and_safety_sender",
+        "label": "OpenAI Trust & Safety 发件人",
+        "description": "邮件发件人包含 trustandsafety@tm.openai.com。"
+      }
+    ]
+  }
+}
+```
+
+#### 单行结果状态
+
+| `results[].status` | 含义 |
+| --- | --- |
+| `disabled` | 已检测到停用/封禁通知 |
+| `active` | 已检测最近邮件，未命中停用通知 |
+| `not_found` | 邮箱不在当前系统账号库中 |
+| `invalid` | 输入不是有效邮箱格式 |
+| `error` | 账号存在，但拉取邮件或详情失败 |
 
 ## 内部 API
 

@@ -98,6 +98,20 @@ def bundled_index_css():
     return Response(combined_css, mimetype='text/css')
 
 
+def static_asset_version(filename: str) -> str:
+    """按静态文件修改时间生成版本戳，避免浏览器沿用旧 JS。"""
+    try:
+        asset_path = Path(app.static_folder) / filename
+        return f"{APP_VERSION}-{asset_path.stat().st_mtime_ns}"
+    except Exception:
+        return APP_VERSION
+
+
+@app.context_processor
+def inject_static_asset_version():
+    return {'static_asset_version': static_asset_version}
+
+
 @app.route('/')
 @login_required
 def index():
@@ -1090,6 +1104,45 @@ def api_batch_update_account_forwarding():
     return jsonify({
         'success': True,
         'message': message,
+        'updated_count': updated_count,
+        'updated_accounts': result.get('updated_accounts', []),
+        'unchanged_count': unchanged_count,
+        'missing_ids': result.get('missing_ids', []),
+    })
+
+
+@app.route('/api/accounts/batch-update-status', methods=['POST'])
+@login_required
+def api_batch_update_account_status():
+    """批量更新账号启用/停用状态"""
+    data = request.json or {}
+    account_ids = data.get('account_ids', [])
+
+    if 'status' not in data:
+        return jsonify({'success': False, 'error': '缺少账号状态参数'})
+
+    status = normalize_account_status(data.get('status'))
+    result = update_accounts_status_by_ids(account_ids, status)
+    if not result.get('success'):
+        return jsonify(result)
+
+    action_label = '启用' if status == 'active' else '停用'
+    updated_count = result.get('updated_count', 0)
+    unchanged_count = result.get('unchanged_count', 0)
+
+    if updated_count and unchanged_count:
+        message = f'已{action_label} {updated_count} 个账号，{unchanged_count} 个账号已处于该状态'
+    elif updated_count:
+        message = f'已{action_label} {updated_count} 个账号'
+    elif unchanged_count:
+        message = f'所选 {unchanged_count} 个账号已处于{action_label}状态'
+    else:
+        message = '没有可更新的账号'
+
+    return jsonify({
+        'success': True,
+        'message': message,
+        'status': result.get('status'),
         'updated_count': updated_count,
         'updated_accounts': result.get('updated_accounts', []),
         'unchanged_count': unchanged_count,

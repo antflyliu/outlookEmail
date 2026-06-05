@@ -2350,6 +2350,66 @@ def update_accounts_forwarding_by_ids(account_ids: List[int], forward_enabled: b
         return {'success': False, 'error': str(e)}
 
 
+def update_accounts_status_by_ids(account_ids: List[int], status: str) -> Dict[str, Any]:
+    """批量更新账号启用/停用状态。"""
+    db = get_db()
+    normalized_ids = normalize_account_ids(account_ids)
+    normalized_status = normalize_account_status(status)
+
+    if not normalized_ids:
+        return {'success': False, 'error': '请选择要修改的账号'}
+
+    placeholders = ','.join('?' * len(normalized_ids))
+    rows = db.execute(
+        f'''
+        SELECT id, email, COALESCE(status, 'active') AS status
+        FROM accounts
+        WHERE id IN ({placeholders})
+        ORDER BY email COLLATE NOCASE ASC
+        ''',
+        normalized_ids
+    ).fetchall()
+
+    if not rows:
+        return {'success': False, 'error': '未找到可修改的账号'}
+
+    existing_ids = [row['id'] for row in rows]
+    existing_id_set = set(existing_ids)
+    missing_ids = [account_id for account_id in normalized_ids if account_id not in existing_id_set]
+    updated_rows = [
+        row for row in rows
+        if normalize_account_status(row['status']) != normalized_status
+    ]
+    updated_ids = [row['id'] for row in updated_rows]
+    updated_accounts = [{'id': row['id'], 'email': row['email']} for row in updated_rows]
+    unchanged_count = len(rows) - len(updated_rows)
+
+    try:
+        if updated_ids:
+            update_placeholders = ','.join('?' * len(updated_ids))
+            db.execute(
+                f'''
+                UPDATE accounts
+                SET status = ?,
+                    updated_at = CURRENT_TIMESTAMP
+                WHERE id IN ({update_placeholders})
+                ''',
+                [normalized_status] + updated_ids
+            )
+        db.commit()
+        return {
+            'success': True,
+            'status': normalized_status,
+            'updated_count': len(updated_ids),
+            'updated_accounts': updated_accounts,
+            'unchanged_count': unchanged_count,
+            'missing_ids': missing_ids,
+        }
+    except Exception as e:
+        db.rollback()
+        return {'success': False, 'error': str(e)}
+
+
 def set_account_forward_cursor(account_id: int, cursor_value: Optional[str]) -> bool:
     """设置账号转发游标。"""
     db = get_db()
